@@ -1,0 +1,16 @@
+services:
+  doccano:
+    image: doccano/doccano:latest
+    container_name: doccano_demo
+    ports:
+      - "8000:8000"
+    environment:
+      ADMIN_USERNAME: admin
+      ADMIN_EMAIL: admin@example.com
+      ADMIN_PASSWORD: password
+    volumes:
+      - doccano-demo-data:/data
+    restart: unless-stopped
+
+volumes:
+  doccano-demo-data:
