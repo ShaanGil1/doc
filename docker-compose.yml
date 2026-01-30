@@ -1,7 +1,6 @@
 services:
   doccano:
     image: doccano/doccano:latest
-    container_name: doccano_demo
     ports:
       - "8000:8000"
     environment:
@@ -9,8 +8,60 @@ services:
       ADMIN_EMAIL: admin@example.com
       ADMIN_PASSWORD: password
     volumes:
-      - doccano-demo-data:/data
+      - doccano-data:/data
     restart: unless-stopped
 
+  postgres:
+    image: postgres:16
+    ports:
+      - "5432:5432"
+    environment:
+      POSTGRES_DB: tagdemo
+      POSTGRES_USER: taguser
+      POSTGRES_PASSWORD: tagpass
+    volumes:
+      - pg-data:/var/lib/postgresql/data
+      - ./postgres/init:/docker-entrypoint-initdb.d:ro
+    restart: unless-stopped
+
+  bridge_bootstrap:
+    build: ./bridge
+    depends_on:
+      - doccano
+      - postgres
+    environment:
+      DOCCANO_BASE_URL: "http://doccano:8000"
+      DOCCANO_USERNAME: "admin"
+      DOCCANO_PASSWORD: "password"
+      PGHOST: "postgres"
+      PGPORT: "5432"
+      PGDATABASE: "tagdemo"
+      PGUSER: "taguser"
+      PGPASSWORD: "tagpass"
+      TAG_PROJECT_NAME: "Tag QA (Demo)"
+      ALIAS_PROJECT_NAME: "Alias QA (Demo)"
+      CLEAR_ON_BOOTSTRAP: "1"
+    command: ["bootstrap"]
+    restart: "no"
+
+  bridge:
+    build: ./bridge
+    depends_on:
+      - doccano
+      - postgres
+    environment:
+      DOCCANO_BASE_URL: "http://doccano:8000"
+      DOCCANO_USERNAME: "admin"
+      DOCCANO_PASSWORD: "password"
+      PGHOST: "postgres"
+      PGPORT: "5432"
+      PGDATABASE: "tagdemo"
+      PGUSER: "taguser"
+      PGPASSWORD: "tagpass"
+      TAG_PROJECT_NAME: "Tag QA (Demo)"
+      ALIAS_PROJECT_NAME: "Alias QA (Demo)"
+    restart: "no"
+
 volumes:
-  doccano-demo-data:
+  doccano-data:
+  pg-data:
