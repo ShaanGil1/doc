@@ -1,0 +1,4 @@
+doccano-client==1.2.8
+urllib3<2
+requests<3
+psycopg2-binary>=2.9.9
