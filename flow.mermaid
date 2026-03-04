@@ -1,0 +1,149 @@
+flowchart TD
+    START(("Writer Begins New Policy"))
+
+    subgraph FORM ["1 - Form Intake and Document Analysis"]
+        direction TB
+        A1["Reference Brief Form - Pre-filled by writer with scope, references, guiding policies, and specialist type. Acts as heavy grounding context for the entire session"]
+        A2{"Prior form or existing draft?"}
+        A3["Analyze Prior Document - Extract structure, language, cited sources, key decisions"]
+        A4["Derive Session Context - Build grounding profile: scope, references, template, constraints. Specialist type determines core refs, search keywords, and handler rules downstream"]
+        A5["Determine Doc Type/Specialist Knowledge - Identify which specialist domain applies and load the corresponding rules, reference docs, keywords, and review criteria for this document type"]
+        A1 --> A2
+        A2 -->|"Yes - prior version exists"| A3
+        A2 -->|"No - new policy"| A4
+        A3 --> A4
+        A4 --> A5
+    end
+
+    subgraph MONITOR ["2 - Writing Monitor"]
+        direction TB
+        B1["Detect Writing Activity - Track section, cursor, delta since last check"]
+        B2{"Meaningful change?"}
+        B1 --> B2
+    end
+
+    subgraph UNDERSTAND ["3 - Understand Writers Need"]
+        direction TB
+        C0{"Writer clicked a button?"}
+        C1["Analyze Writing Context - Extract entities, policy terms, domain keywords"]
+        C2["Classify Suggestion Type - Determine 0-4 categories informed by specialist type: citation, compliance, style, etc."]
+        C3["Check Suggestion History - Suppress repeats, boost variety, respect rejections"]
+        C0 -->|"No - system decides"| C1
+        C0 -->|"Yes - intent locked"| D0
+        C1 --> C2
+        C2 --> C3
+    end
+
+    subgraph SEARCH ["4 - Search and Retrieval"]
+        direction TB
+        D0["Query Rewrite and Search Optimization - Expands acronyms, adds entity context, resolves ambiguous terms. Uses specialist-specific keywords and search patterns. Selects keyword, semantic, or hybrid strategy to maximize retrieval precision"]
+        D0 --> D1
+        R1["Core Reference Documents - NFR, SFASS, and specialist-specific docs. SEARCH BOOSTED - always retrieved first, highest ranking weight. Document set varies by specialist type"]
+        R1 -->|"Boosted priority in every search"| D1
+        D1["Search Existing Policies and References - 1. Core refs boosted 2. Existing DLA policies 3. Broader corpus 4. Targeted keyword lookups"]
+        D1 --> D2
+        D2["Assemble Source Pool - Standardize citations, rank by relevance"]
+    end
+
+    subgraph SUGGEST ["5 - Generate Suggestions"]
+        direction TB
+        E0["Route to Specialized Handlers - Each handler applies rules gathered from the document specialist. Extensible, new categories added as needed"]
+        E2["Citation and Reference - Add missing sources using specialist-relevant documents and standards"]
+        E3["Style Writer - Informs styling and rules to help guide the following rule checks"]
+        E4["Structure and Compliance - Template alignment, required sections per specialist document type"]
+        E5["Rewrite and Tone - Adjust formality, simplify language while preserving specialist domain terminology"]
+        EN["... Additional Handlers - Add specialized nodes per document type, each receiving input from the document specialist. New categories added over time based on client needs"]
+        E0 --> E2
+        E0 --> E4
+        E0 --> E5
+        E0 -.-> EN
+        E3 -->|"Informs tone and rewrite rules"| E5
+        E3 -->|"Informs structural standards"| E4
+    end
+
+    subgraph QUALITY ["6 - Quality Gate"]
+        direction TB
+        QS["DLA Stakeholder Feedback Inputs"]
+        QS1["Historical accept/reject rates by suggestion category"]
+        QS2["Explicit stakeholder instructions - known red flags, no-suggest list, stated preferences"]
+        QS3["Prior document patterns and established language"]
+        F1["Score Suggestion Quality"]
+        F2{"Meets quality threshold?"}
+        F3["Retry with Critique - Append feedback, max 1 retry"]
+        F4["Drop Suggestion - Suppress rather than show bad output"]
+        QS --> QS2
+        QS --> QS3
+        QS1 -->|"Informs scoring thresholds"| F1
+        QS2 --> F1
+        QS3 --> F1
+        F1 --> F2
+        F2 -->|"No - below threshold"| F3
+        F3 --> F1
+        F2 -->|"Yes - passes"| G1
+        F3 -->|"Still fails after retry"| F4
+    end
+
+    subgraph DELIVER ["7 - Format and Deliver"]
+        direction TB
+        G1["Format and Aggregate - Standardize output, attach citations, order by priority"]
+        G2["Safety and Compliance Check - Sanitize, validate format, block sensitive content"]
+        G3["Return to Writer - Deliver suggestions with accept/reject/ignore actions"]
+        G1 --> G2
+        G2 --> G3
+    end
+
+    subgraph LOG ["8 - Learn and Improve"]
+        direction LR
+        H1["Log Run Metadata - Traces, latency, tokens, outcomes"]
+        H2["Track Accept/Reject - Feed into history, quality scoring, core ref updates"]
+        H1 --- H2
+    end
+
+    %% Main flow
+    START --> A1
+    A5 --> B1
+    B2 -->|"Yes"| C0
+    B2 -->|"No - skip this cycle"| B1
+    C3 --> D0
+    D2 --> E0
+    E2 --> F1
+    E4 --> F1
+    E5 --> F1
+    G3 --> H1
+
+    %% Feedback loops
+    H2 -.->|"Accept/reject rates update quality thresholds"| QS1
+    H2 -.->|"Usage analytics update core ref priorities"| R1
+
+    %% Prior doc grounding
+    A3 -.->|"Heavy grounding throughout session"| C1
+    A3 -.->|"Prior doc patterns inform search"| D0
+
+    %% Styling
+    classDef formnode fill:#1a5276,stroke:#0d2137,color:#ffffff
+    classDef monitor fill:#2e86c1,stroke:#1a5276,color:#ffffff
+    classDef understand fill:#2874a6,stroke:#1a5276,color:#ffffff
+    classDef search fill:#1a6e3a,stroke:#0d4422,color:#ffffff
+    classDef suggest fill:#7d3c98,stroke:#4a235a,color:#ffffff
+    classDef quality fill:#c0392b,stroke:#922b21,color:#ffffff
+    classDef deliver fill:#b9770e,stroke:#7e5109,color:#ffffff
+    classDef lognode fill:#5d6d7e,stroke:#2c3e50,color:#ffffff
+    classDef coreref fill:#117a65,stroke:#0b5345,color:#ffffff
+    classDef startnode fill:#0d2137,stroke:#000000,color:#ffffff
+    classDef dropnode fill:#7f8c8d,stroke:#566573,color:#ffffff
+    classDef stakeholder fill:#943126,stroke:#6e2c00,color:#ffffff
+    classDef extnode fill:#6c3483,stroke:#4a235a,color:#ffffff,stroke-dasharray: 5 5
+
+    class A1,A2,A3,A4,A5 formnode
+    class B1,B2 monitor
+    class C0,C1,C2,C3 understand
+    class D0,D1,D2 search
+    class R1 coreref
+    class E0,E2,E3,E4,E5 suggest
+    class EN extnode
+    class F1,F2,F3 quality
+    class F4 dropnode
+    class QS,QS1,QS2,QS3 stakeholder
+    class G1,G2,G3 deliver
+    class H1,H2 lognode
+    class START startnode
