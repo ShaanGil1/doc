@@ -75,3 +75,33 @@ Postgres logs:
 ```powershell
 docker compose logs postgres --tail 200
 ```
+
+
+interaction_graphs/
+    document_write_flow.py      ← user initializes + writes a doc
+    document_review_flow.py     ← user starts a review
+    search_flow.py              ← user searches for documents
+    write_then_review_flow.py   ← combined loop flow
+state/
+writer/
+    main_graph.py
+    writer_supervisor.py
+    intake_agent.py
+    specialist_writer/
+        ...
+reviewer/
+    main_graph.py
+    ...
+researcher/
+    main_graph.py
+    ...
+citation/
+    main_graph.py
+    ...
+examples/
+    simple_node.py              ← bare minimum node pattern
+    node_with_retry_loop.py     ← gap/feedback loop pattern
+    parallel_dispatch_node.py   ← Send() parallel pattern
+    supervisor_pattern.py       ← supervisor → sub-agent pattern
+    conditional_routing.py      ← branching/decision pattern
+    nested_subgraph.py          ← subgraph inside a subgraph
