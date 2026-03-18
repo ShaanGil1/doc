@@ -1,0 +1,76 @@
+Hi! I will be going over logging the work we have done this sprint regarding it and why. Logging is something that long term unlocks a lot of potential and could benefit in both enhancing the application by providing insight into the application's usage and speeds up development time. So in this sprint we documented coding standards and what items we want to log along with the basic architecture. The sooner logging is set up the more data it collects and the more useful it can be long term.  The following diagram highlights the high level approach we have to logging. On the left side we have the application and some of the components, in the middle we have some the actual metrics we would like to log such as button clicks, response times, citations, agent history and many more. We would then combine all these metrics into a central hub and then we could potentially provide some of the feature on the right side including personalization, feedback loop, analytics/reporting, and error reports. 
+
+So lets just talk more about each of the potential outcomes this can unlock such as:
+Autonomous feedback loop:
+- Given user feedback we can make the system better and better at giving quality responses
+- This could come from which suggestions the users like and don't like, we could use the feedback provided to help guide the agents to learn from that
+- This would be a downstream system we could set up and with more and more data it would update 
+
+Personalization:
+- Track user behavior and performance overtime 
+- Experience gets tailored to the specific user
+- This could include document preferences if a user commonly uses a specific document it would detect this and consistently keep recommending that 
+- This could also be matching writer styling/tone 
+
+Analytics and Reporting:
+- This would provide full visibility over the application
+- Give admin level insights into what is happening inside of the application - allows you to see how users are engaging with the system
+- Autonomous updating dashboard with application insights and data
+- Derive trends and patterns to help inform decisions 
+
+Error Reporting:
+- This allows for rapid delivery for devs because tracing problems becomes a lot quicker
+- Dev time can be put more towards building and not investigating issues and bugs 
+- We can ship more features faster and with built-in diagnostics and we can catch these problems early resulting in future delays
+
+These are just some of the benefits that logging could yield which is why this is something we want keep in mind early so that the benefits compound early. 
+If there are any question happy to take then otherwise I will pass it to...
+
+
+SLIDE 2 — What Logging Could Unlock
+Autonomous Feedback Loop
+
+Given user feedback, the system could get better and better at giving quality responses
+Could learn from which suggestions users like and don't like — feedback helps guide the agents
+A downstream system we could set up that updates with more and more data over time
+
+Personalization
+
+Could track user behavior and preferences over time
+Experience gets tailored to the specific user
+Could include document preferences — if a user commonly uses a specific document, the system detects this and keeps recommending it
+Could also extend to matching writing style and tone
+
+Analytics & Reporting
+
+Would provide full visibility over the application
+Admin-level insights into what is happening inside the application — see how users are engaging with the system
+Autonomously updating dashboards with application insights and data
+Could help derive trends and patterns to inform decisions
+
+Error Reporting
+
+Enables rapid delivery — tracing problems becomes significantly quicker
+Dev time goes toward building, not investigating issues and bugs
+Could ship more features faster with built-in diagnostics — catch problems early, avoid future delays
+
+Questions Prep:
+In general: DO NOT promise anything the wording around the presentation needs to use word like "could, "potential", "might" to give an idea of what logging *could* do not what it WILL do
+
+Q: How long until we actually see benefits from this?
+A: The foundation we documented this sprint is the first step. Once logging is active, data starts accumulating immediately. Some benefits like error reporting are almost instant, we could trace issues right away. Others like the feedback loop and personalization are longer-term and get more valuable the more data we collect, which is exactly why we want to start early.
+
+Q: What's the effort to actually implement this? How much dev time are we talking?
+A: This sprint was about the standards and architecture basically a blueprint. Implementation would be incremental and we wouldn't do it all at once. Basic logging and error reporting could come first since those have the most immediate payoff. The standards we set means will we be adding logs to pieces of code we build as they are needed
+
+Q: Is this going to slow down feature development?
+A: Short term there's a small investment, but it actually speeds things up. Right now when something goes wrong, debugging takes time because we're working blind. With logging in place, we could pinpoint issues much faster, which means less rework and more time building new things.
+
+Q: Who has access?
+A: Configurable. We could set it up so that admins and stakeholders have access to high-level dashboards. But this decision on access can be decided as needed
+
+Q: Can you give a concrete example of how the feedback loop would work?
+A: Say a use types some and then agent suggests something and the user accepts it. If we're logging which suggestions users accept and which they ignore or reject, over time we could use that data to tune the agent so it leads with the types of suggestions that tend to get accepted. The agent could learn what "good" looks like from real usage.
+
+Q: Why not just use off-the-shelf analytics like Google Analytics?
+A: We have looked into leveraging and integrating in to the GCP built in analytics but it would not cover everything we want log within our code. However, it could be something useful we look further into integrating. (But with the gcp delays it was hard to look at the features covered)
