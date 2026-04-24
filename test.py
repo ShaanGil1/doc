@@ -279,23 +279,43 @@ class _DepthTracker:
     Rules:
     - If (num_id, ilvl) is already on the stack, this is a continuation.
       Truncate the stack to that spot and return its depth.
-    - Otherwise push it. But first pop any same-num_id entries whose
-      ilvl is >= this one (those contexts have ended).
-    - We deliberately don't pop entries from a DIFFERENT num_id, because
-      in Word a sub-list often uses a separate num_id from its parent
-      and we want it to stack on top, not replace.
+    - If the caller signals "there was body content since the last list
+      item" AND this is a fresh num_id at ilvl=0, reset the stack. This
+      catches the case of two independent top-level lists separated by
+      normal paragraphs, where Word assigns them different numIds but
+      they should both sit at depth 1, not pile on top of each other.
+    - Otherwise push. Before pushing, pop any same-num_id entries whose
+      ilvl is >= this one (those contexts have ended). We don't pop
+      entries from a DIFFERENT num_id, because a nested sub-list
+      (which comes right after its parent, no body text between) often
+      uses its own num_id and we want it to stack on top.
     """
 
     def __init__(self):
         self.stack: list[tuple[str, int]] = []
 
-    def depth_for(self, num_id: str, ilvl: int) -> int:
+    def depth_for(
+        self,
+        num_id: str,
+        ilvl: int,
+        body_since_last_list: bool = False,
+    ) -> int:
         entry = (num_id, ilvl)
 
+        # Continuation of something already on the stack
         for i, existing in enumerate(self.stack):
             if existing == entry:
                 del self.stack[i + 1:]
                 return i + 1
+
+        # Fresh top-level list after a break of body content
+        if (
+            body_since_last_list
+            and ilvl == 0
+            and not any(e[0] == num_id for e in self.stack)
+        ):
+            self.stack = [entry]
+            return 1
 
         while self.stack:
             top_num, top_ilvl = self.stack[-1]
@@ -369,6 +389,11 @@ def convert(
     depth = _DepthTracker()
     lines: list[str] = []
 
+    # flips to True when we pass any semantic content between list items
+    # (body paragraph, heading, or table). Flipping it back to False happens
+    # only when we actually emit a list item.
+    body_since_last_list = False
+
     def ensure_blank_line():
         if lines and lines[-1] != "":
             lines.append("")
@@ -380,6 +405,7 @@ def convert(
             ensure_blank_line()
             lines.append(_table_to_markdown(tbl))
             lines.append("")
+            body_since_last_list = True
             continue
 
         if element.tag != qn('w:p'):
@@ -398,13 +424,15 @@ def convert(
             ensure_blank_line()
             lines.append(f"{'#' * style_level} {text.strip()}")
             lines.append("")
+            body_since_last_list = True
             continue
 
         # 2. list item
         list_info = numbering.resolve(para)
         if list_info is not None:
             num_id, ilvl, fmt, marker = list_info
-            d = depth.depth_for(num_id, ilvl)
+            d = depth.depth_for(num_id, ilvl, body_since_last_list=body_since_last_list)
+            body_since_last_list = False
 
             if fmt == 'bullet':
                 indent = "    " * (d - 1)
@@ -425,10 +453,12 @@ def convert(
             ensure_blank_line()
             lines.append(f"# {text.strip()}")
             lines.append("")
+            body_since_last_list = True
             continue
 
         # 4. regular body text
         lines.append(text)
+        body_since_last_list = True
 
     result = "\n".join(lines)
     result = re.sub(r'\n{3,}', '\n\n', result)
