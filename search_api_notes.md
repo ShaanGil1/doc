@@ -531,3 +531,262 @@ def split_markdown(
 #         result.append({"title": section.title, "content": "\n".join(c for c in cleaned if c)})
 #     return result
 ```
+
+``` python
+"""
+Converts .docx files to markdown.
+
+Reads heading styles, inline formatting (bold/italic), tables, and lists
+directly from the docx XML. No AI, no layout models -- the document
+already knows its own structure.
+
+Usage:
+    from docx_to_md import convert
+
+    markdown = convert("path/to/doc.docx")
+"""
+
+from __future__ import annotations
+
+import re
+from pathlib import Path
+
+from docx import Document
+from docx.table import Table
+from docx.text.paragraph import Paragraph
+from docx.oxml.ns import qn
+
+
+# ---------------------------------------------------------------------------
+# Inline formatting (bold, italic) from runs within a paragraph
+# ---------------------------------------------------------------------------
+
+def _format_runs(paragraph: Paragraph) -> str:
+    """
+    Walk the runs in a paragraph and wrap bold/italic text in markdown syntax.
+    Consecutive runs with the same formatting get merged before wrapping.
+    """
+    if not paragraph.runs:
+        return paragraph.text
+
+    parts = []
+    for run in paragraph.runs:
+        text = run.text
+        if not text:
+            continue
+
+        bold = run.bold
+        italic = run.italic
+
+        # don't wrap whitespace-only runs in formatting
+        if not text.strip():
+            parts.append(text)
+            continue
+
+        # pull leading/trailing whitespace outside the formatting markers
+        # so we don't get "**SUBJECT: **" but "**SUBJECT:** " instead
+        leading = text[:len(text) - len(text.lstrip())]
+        trailing = text[len(text.rstrip()):]
+        inner = text.strip()
+
+        if bold and italic:
+            parts.append(f"{leading}***{inner}***{trailing}")
+        elif bold:
+            parts.append(f"{leading}**{inner}**{trailing}")
+        elif italic:
+            parts.append(f"{leading}*{inner}*{trailing}")
+        else:
+            parts.append(text)
+
+    # clean up cases where adjacent runs have the same formatting
+    # e.g. "**foo****bar**" -> "**foobar**"
+    result = "".join(parts)
+    result = re.sub(r'\*\*\*\*\*\*', '', result)  # ***text******text*** merges
+    result = re.sub(r'\*\*\*\*', '', result)        # **text****text** merges
+    result = re.sub(r'\*\*\s+\*\*', ' ', result)   # ** ** -> single space
+    result = re.sub(r'\*\s+\*', ' ', result)
+
+    return result
+
+
+# ---------------------------------------------------------------------------
+# Heading detection
+# ---------------------------------------------------------------------------
+
+# maps word style names to markdown heading levels
+_HEADING_MAP = {
+    "heading 1": "#",
+    "heading 2": "##",
+    "heading 3": "###",
+    "heading 4": "####",
+    "heading 5": "#####",
+    "heading 6": "######",
+    "title": "#",
+    "subtitle": "##",
+}
+
+
+def _get_heading_prefix(paragraph: Paragraph) -> str | None:
+    """Return the markdown heading prefix if this paragraph is a heading, else None."""
+    style_name = (paragraph.style.name or "").lower()
+    # check exact match first, then prefix match (handles "Heading 1,Custom" etc.)
+    for key, prefix in _HEADING_MAP.items():
+        if style_name == key or style_name.startswith(key):
+            return prefix
+    return None
+
+
+# ---------------------------------------------------------------------------
+# List detection
+# ---------------------------------------------------------------------------
+
+def _get_list_info(paragraph: Paragraph) -> tuple[str | None, int]:
+    """
+    Check if a paragraph is a list item by looking at the underlying XML
+    for numPr (numbering properties).
+
+    Returns (list_type, indent_level) where list_type is "bullet", "number", or None.
+    """
+    pPr = paragraph._element.find(qn('w:pPr'))
+    if pPr is None:
+        return None, 0
+
+    numPr = pPr.find(qn('w:numPr'))
+    if numPr is None:
+        return None, 0
+
+    ilvl_elem = numPr.find(qn('w:ilvl'))
+    indent = int(ilvl_elem.get(qn('w:val'), '0')) if ilvl_elem is not None else 0
+
+    # try to determine bullet vs numbered from the style name
+    style_name = (paragraph.style.name or "").lower()
+    if "bullet" in style_name or "list bullet" in style_name:
+        return "bullet", indent
+    elif "number" in style_name or "list number" in style_name:
+        return "number", indent
+
+    # fallback: check the abstract numbering definition
+    # if we can't tell, default to bullet
+    return "bullet", indent
+
+
+# ---------------------------------------------------------------------------
+# Table conversion
+# ---------------------------------------------------------------------------
+
+def _table_to_markdown(table: Table) -> str:
+    """Convert a docx table to a markdown table."""
+    rows = []
+    for row in table.rows:
+        cells = []
+        for cell in row.cells:
+            # get cell text, collapse newlines within cells
+            text = cell.text.strip().replace("\n", " ")
+            cells.append(text)
+        rows.append(cells)
+
+    if not rows:
+        return ""
+
+    # build markdown table
+    lines = []
+
+    # header row
+    lines.append("| " + " | ".join(rows[0]) + " |")
+
+    # separator
+    lines.append("| " + " | ".join("---" for _ in rows[0]) + " |")
+
+    # data rows
+    for row in rows[1:]:
+        # pad row to match header length if needed
+        while len(row) < len(rows[0]):
+            row.append("")
+        lines.append("| " + " | ".join(row[:len(rows[0])]) + " |")
+
+    return "\n".join(lines)
+
+
+# ---------------------------------------------------------------------------
+# Main converter
+# ---------------------------------------------------------------------------
+
+def convert(file_path: str | Path) -> str:
+    """
+    Convert a .docx file to markdown.
+
+    Handles:
+    - Headings (from paragraph styles)
+    - Bold and italic formatting (from runs)
+    - Bullet and numbered lists
+    - Tables
+    - Regular body text
+
+    Returns the full markdown as a string.
+    """
+    doc = Document(str(file_path))
+    lines: list[str] = []
+    number_counters: dict[int, int] = {}  # track numbering per indent level
+
+    # docx body can contain paragraphs and tables interleaved
+    for element in doc.element.body:
+        # check if this element is a table
+        if element.tag == qn('w:tbl'):
+            table = None
+            for t in doc.tables:
+                if t._element is element:
+                    table = t
+                    break
+            if table:
+                lines.append("")
+                lines.append(_table_to_markdown(table))
+                lines.append("")
+            continue
+
+        # check if this is a paragraph
+        if element.tag != qn('w:p'):
+            continue
+
+        para = Paragraph(element, doc)
+        text = _format_runs(para)
+
+        # skip empty paragraphs (but preserve one blank line)
+        if not text.strip():
+            # avoid double blank lines
+            if lines and lines[-1] != "":
+                lines.append("")
+            continue
+
+        # check if it's a heading
+        heading_prefix = _get_heading_prefix(para)
+        if heading_prefix:
+            lines.append("")
+            lines.append(f"{heading_prefix} {text.strip()}")
+            lines.append("")
+            number_counters.clear()
+            continue
+
+        # check if it's a list item
+        list_type, indent = _get_list_info(para)
+        if list_type:
+            prefix_indent = "  " * indent
+            if list_type == "number":
+                number_counters[indent] = number_counters.get(indent, 0) + 1
+                # reset deeper levels
+                for k in list(number_counters):
+                    if k > indent:
+                        del number_counters[k]
+                lines.append(f"{prefix_indent}{number_counters[indent]}. {text.strip()}")
+            else:
+                lines.append(f"{prefix_indent}- {text.strip()}")
+            continue
+
+        # regular paragraph
+        lines.append(text)
+
+    # clean up excessive blank lines
+    result = "\n".join(lines)
+    result = re.sub(r'\n{3,}', '\n\n', result)
+    return result.strip()
+```
+
