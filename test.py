@@ -138,10 +138,23 @@ def _load_numbering_defs(doc):
             f = l.find(qn('w:numFmt'))
             t = l.find(qn('w:lvlText'))
             s = l.find(qn('w:start'))
+            # pull left indent off the level's default pPr if present
+            indent = None
+            lvl_pPr = l.find(qn('w:pPr'))
+            if lvl_pPr is not None:
+                ind = lvl_pPr.find(qn('w:ind'))
+                if ind is not None:
+                    left = ind.get(qn('w:left'))
+                    if left is not None:
+                        try:
+                            indent = int(left)
+                        except ValueError:
+                            pass
             lvls[il] = {
                 'fmt': f.get(qn('w:val')) if f is not None else 'decimal',
                 'text': t.get(qn('w:val')) if t is not None else f'%{il + 1}.',
                 'start': int(s.get(qn('w:val'))) if s is not None else 1,
+                'indent': indent,
             }
         abs_defs[a.get(qn('w:abstractNumId'))] = lvls
     for n in part.element.findall(qn('w:num')):
@@ -151,42 +164,91 @@ def _load_numbering_defs(doc):
     return defs
 
 
+def _indent_of(para_elem, nid, ilvl, defs):
+    """
+    Return left indent in twips. Prefer the paragraph's own w:ind, fall
+    back to the numbering level's default indent, else None.
+    """
+    pPr = para_elem.find(qn('w:pPr'))
+    if pPr is not None:
+        ind = pPr.find(qn('w:ind'))
+        if ind is not None:
+            left = ind.get(qn('w:left'))
+            if left is not None:
+                try:
+                    return int(left)
+                except ValueError:
+                    pass
+    lvl = defs.get(nid, {}).get(ilvl)
+    return lvl.get('indent') if lvl else None
+
+
 def _walk(doc):
     defs = _load_numbering_defs(doc)
     last_pos, parents = _scan_lists(doc)
 
     stack = []          # list of (num_id, ilvl)
+    stack_indents = []  # parallel list of indents (twips) or None
     counters = {}       # num_id -> {ilvl: count}
     list_pos = 0        # current list-item index
 
-    def compute_depth(nid, il):
+    def compute_depth(nid, il, indent):
         entry = (nid, il)
         # (1) exact match on stack -> truncate to it
         for i in range(len(stack) - 1, -1, -1):
             if stack[i] == entry:
                 del stack[i + 1:]
+                del stack_indents[i + 1:]
                 return i + 1
-        # (2) this is a NEW parent numId and everything on the stack is already
-        # dead (its last occurrence is before this position) -> the prior list
-        # world is over, start fresh at depth 1
+        # (2) new parent numId whose previous list contexts are all dead -> reset
         if nid in parents and not any(s[0] == nid for s in stack):
             if not any(last_pos.get(s[0], -1) >= list_pos for s in stack):
                 stack.clear()
+                stack_indents.clear()
                 stack.append(entry)
+                stack_indents.append(indent)
                 return 1
         # (3) same numId at different ilvl -> pop back to it, then push/replace
         for i in range(len(stack) - 1, -1, -1):
             if stack[i][0] == nid:
                 del stack[i + 1:]
+                del stack_indents[i + 1:]
                 top_il = stack[-1][1]
                 if il > top_il:
                     stack.append(entry)
+                    stack_indents.append(indent)
                 else:
                     stack[-1] = entry
+                    stack_indents[-1] = indent
                 return len(stack)
-        # (4) completely new numId (non-parent, or parent with still-alive
-        # contexts on the stack) -> push as sub-list of current top
+        # (4) brand new numId. Default is to push as a sub-list. But if we
+        # have indent info, try to match this entry's indent to an existing
+        # stack level's indent (whichever is closest) and slot in there
+        # instead of pushing deeper. Ties prefer deeper (later stack index).
+        if indent is not None:
+            candidates = [
+                (i, s) for i, s in enumerate(stack_indents) if s is not None
+            ]
+            if candidates:
+                closest_i, closest_ind = candidates[0]
+                for i, s_ind in candidates[1:]:
+                    if abs(indent - s_ind) <= abs(indent - closest_ind):
+                        closest_i, closest_ind = i, s_ind
+                # only push deeper if indent is strictly past the top AND
+                # the closest match is already the top; otherwise collapse
+                if closest_i == len(stack) - 1 and indent > closest_ind:
+                    stack.append(entry)
+                    stack_indents.append(indent)
+                    return len(stack)
+                # slot at depth closest_i + 1, replacing everything from there
+                del stack[closest_i:]
+                del stack_indents[closest_i:]
+                stack.append(entry)
+                stack_indents.append(indent)
+                return len(stack)
+        # no indent signal -> fall back to blind push (original behavior)
         stack.append(entry)
+        stack_indents.append(indent)
         return len(stack)
 
     for el in doc.element.body:
@@ -250,7 +312,7 @@ def _walk(doc):
                         )
                 marker = re.sub(r'%\d+', '', marker)
 
-            d = compute_depth(nid, il)
+            d = compute_depth(nid, il, _indent_of(el, nid, il, defs))
             list_pos += 1
             yield {
                 'kind': 'list', 'num_id': nid, 'ilvl': il,
