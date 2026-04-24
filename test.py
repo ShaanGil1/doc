@@ -1,18 +1,21 @@
 """
-Converts .docx files to markdown.
+Convert .docx to markdown.
 
-Approach: scan the doc once to build {numId: {ilvl: depth}} by ranking the
-ilvls that actually appear in each numbering chain. Then emit markdown
-using a pure lookup. Each numId is its own chain and starts fresh at
-depth 1. Ilvl jumps inside a chain get compressed, so a chain using
-{0, 2, 5} produces depths {1, 2, 3} with no skipped markdown levels.
+Two entry points:
+    convert(path)  -> returns the markdown string
+    inspect(path)  -> prints what the converter sees in the doc,
+                      useful for debugging when the output looks wrong
+
+The algorithm:
+    1. Load numbering.xml so we can generate marker text (1., a., 1.1, etc.)
+    2. Build a depth map: for each numId, rank the ilvls that actually
+       appear and assign depth = rank + 1. Each numId chain is independent
+       and starts at depth 1.
+    3. Walk the body. For each list paragraph, look up its depth in the
+       map and emit `#` * (depth + 1) + marker + text.
 """
 
-from __future__ import annotations
-
 import re
-from pathlib import Path
-
 from docx import Document
 from docx.table import Table
 from docx.text.paragraph import Paragraph
@@ -20,305 +23,284 @@ from docx.oxml.ns import qn
 
 
 # ---------------------------------------------------------------------------
-# Inline formatting
+# Low-level helpers
 # ---------------------------------------------------------------------------
 
-def _format_runs(paragraph: Paragraph) -> str:
-    if not paragraph.runs:
-        return paragraph.text
-
-    parts = []
-    for run in paragraph.runs:
-        text = run.text
-        if not text:
-            continue
-        if not text.strip():
-            parts.append(text)
-            continue
-
-        leading = text[:len(text) - len(text.lstrip())]
-        trailing = text[len(text.rstrip()):]
-        inner = text.strip()
-
-        if run.bold and run.italic:
-            parts.append(f"{leading}***{inner}***{trailing}")
-        elif run.bold:
-            parts.append(f"{leading}**{inner}**{trailing}")
-        elif run.italic:
-            parts.append(f"{leading}*{inner}*{trailing}")
-        else:
-            parts.append(text)
-
-    # collapse adjacent markers left over from consecutive same-style runs
-    result = "".join(parts)
-    result = re.sub(r'\*\*\*\*\*\*', '', result)
-    result = re.sub(r'\*\*\*\*', '', result)
-    return result
-
-
-# ---------------------------------------------------------------------------
-# Heading detection
-# ---------------------------------------------------------------------------
-
-_HEADING_STYLE_MAP = {
-    "heading 1": 1, "heading 2": 2, "heading 3": 3,
-    "heading 4": 4, "heading 5": 5, "heading 6": 6,
-    "title": 1, "subtitle": 2,
-}
-
-_HEADER_KEYWORDS = ("heading", "title", "header", "chapter", "section", "subtitle")
-
-
-def _style_heading_level(paragraph: Paragraph) -> int | None:
-    name = (paragraph.style.name or "").lower()
-    for key, level in _HEADING_STYLE_MAP.items():
-        if name == key or name.startswith(key):
-            return level
-    return 1 if any(kw in name for kw in _HEADER_KEYWORDS) else None
-
-
-def _looks_like_header(paragraph: Paragraph) -> bool:
-    """Bold-only paragraphs or ones with 14pt+ font, under 140 chars."""
-    text = paragraph.text.strip()
-    if not text or len(text) > 140:
-        return False
-
-    content_runs = [r for r in paragraph.runs if r.text.strip()]
-    if not content_runs:
-        return False
-
-    if all(r.bold for r in content_runs):
-        return True
-
-    for r in content_runs:
-        size = getattr(r.font, 'size', None)
-        if size is not None and getattr(size, 'pt', 0) >= 14:
-            return True
-    return False
-
-
-# ---------------------------------------------------------------------------
-# Number formatting for list markers
-# ---------------------------------------------------------------------------
-
-def _format_number(value: int, fmt: str) -> str:
-    if fmt == 'lowerLetter':
-        base = ord('a')
-    elif fmt == 'upperLetter':
-        base = ord('A')
-    else:
-        # decimal and anything unsupported (roman, ordinal, etc.) -> decimal
-        return str(value)
-
-    if value <= 26:
-        return chr(base + value - 1)
-    # aa, bb, cc for 27, 28, 29 (Word convention)
-    return chr(base + ((value - 1) % 26)) * (((value - 1) // 26) + 1)
-
-
-# ---------------------------------------------------------------------------
-# numPr extraction and depth map
-# ---------------------------------------------------------------------------
-
-def _read_numpr(para_elem):
-    """Pull (num_id, ilvl) off a paragraph element, or return None."""
+def _numpr(para_elem):
+    """If paragraph is a list item, return (num_id, ilvl). Otherwise None."""
     pPr = para_elem.find(qn('w:pPr'))
     if pPr is None:
         return None
     numPr = pPr.find(qn('w:numPr'))
     if numPr is None:
         return None
-    num_id_el = numPr.find(qn('w:numId'))
-    if num_id_el is None:
+    nid_el = numPr.find(qn('w:numId'))
+    if nid_el is None:
         return None
-    num_id = num_id_el.get(qn('w:val'))
-    if num_id == '0':
+    nid = nid_el.get(qn('w:val'))
+    if nid == '0':
         return None
-    ilvl_el = numPr.find(qn('w:ilvl'))
-    ilvl = int(ilvl_el.get(qn('w:val'), '0')) if ilvl_el is not None else 0
-    return (num_id, ilvl)
+    il_el = numPr.find(qn('w:ilvl'))
+    ilvl = int(il_el.get(qn('w:val'), '0')) if il_el is not None else 0
+    return (nid, ilvl)
 
 
-def _build_depth_map(doc) -> dict[str, dict[int, int]]:
-    """
-    {numId: {ilvl: depth}} where depth starts at 1 and is the rank of
-    each ilvl among those actually used in that chain.
-    """
-    seen: dict[str, set[int]] = {}
-    for p in doc.element.body.iter(qn('w:p')):
-        info = _read_numpr(p)
-        if info is not None:
-            num_id, ilvl = info
-            seen.setdefault(num_id, set()).add(ilvl)
-
-    return {
-        num_id: {ilvl: rank + 1 for rank, ilvl in enumerate(sorted(ilvls))}
-        for num_id, ilvls in seen.items()
-    }
+def _format_number(value, fmt):
+    if fmt == 'lowerLetter' and value <= 26:
+        return chr(ord('a') + value - 1)
+    if fmt == 'upperLetter' and value <= 26:
+        return chr(ord('A') + value - 1)
+    return str(value)
 
 
-# ---------------------------------------------------------------------------
-# Numbering resolver: read numbering.xml, track counters, render markers
-# ---------------------------------------------------------------------------
-
-class _NumberingTracker:
-    def __init__(self, doc):
-        self._defs: dict[str, dict[int, dict]] = {}
-        self._counters: dict[str, dict[int, int]] = {}
-        self._load(doc)
-
-    def _load(self, doc):
-        try:
-            part = doc.part.numbering_part
-        except (AttributeError, KeyError, NotImplementedError):
-            return
-        if part is None:
-            return
-
-        abstract_defs: dict[str, dict[int, dict]] = {}
-        for abs_num in part.element.findall(qn('w:abstractNum')):
-            abs_id = abs_num.get(qn('w:abstractNumId'))
-            levels: dict[int, dict] = {}
-            for lvl in abs_num.findall(qn('w:lvl')):
-                ilvl = int(lvl.get(qn('w:ilvl'), '0'))
-                fmt_el = lvl.find(qn('w:numFmt'))
-                text_el = lvl.find(qn('w:lvlText'))
-                start_el = lvl.find(qn('w:start'))
-                levels[ilvl] = {
-                    'fmt': fmt_el.get(qn('w:val')) if fmt_el is not None else 'decimal',
-                    'text': text_el.get(qn('w:val')) if text_el is not None else f'%{ilvl + 1}.',
-                    'start': int(start_el.get(qn('w:val'))) if start_el is not None else 1,
-                }
-            abstract_defs[abs_id] = levels
-
-        for num in part.element.findall(qn('w:num')):
-            ref = num.find(qn('w:abstractNumId'))
-            if ref is not None:
-                abs_id = ref.get(qn('w:val'))
-                if abs_id in abstract_defs:
-                    self._defs[num.get(qn('w:numId'))] = abstract_defs[abs_id]
-
-    def resolve(self, paragraph: Paragraph):
-        """Returns (num_id, ilvl, fmt, marker_text) or None."""
-        info = _read_numpr(paragraph._element)
-        if info is None:
-            return None
-        num_id, ilvl = info
-
-        levels = self._defs.get(num_id, {})
-        level_def = levels.get(ilvl)
-
-        # advance counters: reset deeper levels, bump or start this one
-        counters = self._counters.setdefault(num_id, {})
-        for k in [k for k in counters if k > ilvl]:
-            del counters[k]
-        start = level_def['start'] if level_def else 1
-        counters[ilvl] = counters[ilvl] + 1 if ilvl in counters else start
-
-        # no definition for this level -> fall back to a plain "1.2.3." form
-        if level_def is None:
-            parts = [str(counters[lv]) for lv in sorted(counters) if lv <= ilvl]
-            return (num_id, ilvl, 'decimal', '.'.join(parts) + '.')
-
-        fmt = level_def['fmt']
-        if fmt == 'bullet':
-            return (num_id, ilvl, fmt, '')
-
-        marker = level_def['text']
-        for lv in range(ilvl + 1):
-            if lv in levels:
-                val = counters.get(lv, levels[lv]['start'])
-                marker = marker.replace(f'%{lv + 1}', _format_number(val, levels[lv]['fmt']))
-        marker = re.sub(r'%\d+', '', marker)
-        return (num_id, ilvl, fmt, marker)
+def _format_runs(paragraph):
+    parts = []
+    for r in paragraph.runs:
+        t = r.text
+        if not t:
+            continue
+        if not t.strip():
+            parts.append(t)
+            continue
+        lead = t[:len(t) - len(t.lstrip())]
+        trail = t[len(t.rstrip()):]
+        inner = t.strip()
+        if r.bold and r.italic:
+            parts.append(f'{lead}***{inner}***{trail}')
+        elif r.bold:
+            parts.append(f'{lead}**{inner}**{trail}')
+        elif r.italic:
+            parts.append(f'{lead}*{inner}*{trail}')
+        else:
+            parts.append(t)
+    result = ''.join(parts) if parts else paragraph.text
+    result = re.sub(r'\*\*\*\*\*\*', '', result)
+    result = re.sub(r'\*\*\*\*', '', result)
+    return result
 
 
-# ---------------------------------------------------------------------------
-# Tables
-# ---------------------------------------------------------------------------
-
-def _table_to_markdown(table: Table) -> str:
+def _table_md(table):
     rows = [[c.text.strip().replace('\n', ' ') for c in r.cells] for r in table.rows]
     if not rows:
         return ''
-
     cols = max(len(r) for r in rows)
     pad = lambda r: (r + [''] * (cols - len(r)))[:cols]
-
-    lines = [
+    out = [
         '| ' + ' | '.join(pad(rows[0])) + ' |',
         '| ' + ' | '.join('---' for _ in range(cols)) + ' |',
     ]
-    lines += ['| ' + ' | '.join(pad(r)) + ' |' for r in rows[1:]]
-    return '\n'.join(lines)
+    out += ['| ' + ' | '.join(pad(r)) + ' |' for r in rows[1:]]
+    return '\n'.join(out)
 
 
 # ---------------------------------------------------------------------------
-# Main converter
+# The core walk: yields one dict per body item
 # ---------------------------------------------------------------------------
 
-# depth 1 ('1.') -> ##, depth 2 -> ###, etc. Bump this to push lists deeper.
-_LIST_HEADING_OFFSET = 1
+def _walk(doc):
+    # load numbering definitions
+    defs = {}
+    try:
+        part = doc.part.numbering_part
+    except Exception:
+        part = None
+    if part is not None:
+        abs_defs = {}
+        for a in part.element.findall(qn('w:abstractNum')):
+            lvls = {}
+            for l in a.findall(qn('w:lvl')):
+                il = int(l.get(qn('w:ilvl'), '0'))
+                f = l.find(qn('w:numFmt'))
+                t = l.find(qn('w:lvlText'))
+                s = l.find(qn('w:start'))
+                lvls[il] = {
+                    'fmt': f.get(qn('w:val')) if f is not None else 'decimal',
+                    'text': t.get(qn('w:val')) if t is not None else f'%{il + 1}.',
+                    'start': int(s.get(qn('w:val'))) if s is not None else 1,
+                }
+            abs_defs[a.get(qn('w:abstractNumId'))] = lvls
+        for n in part.element.findall(qn('w:num')):
+            r = n.find(qn('w:abstractNumId'))
+            if r is not None and r.get(qn('w:val')) in abs_defs:
+                defs[n.get(qn('w:numId'))] = abs_defs[r.get(qn('w:val'))]
 
+    # build depth map: rank ilvls within each numId
+    seen = {}
+    for p in doc.element.body.iter(qn('w:p')):
+        info = _numpr(p)
+        if info:
+            seen.setdefault(info[0], set()).add(info[1])
+    depth_map = {
+        nid: {il: rank + 1 for rank, il in enumerate(sorted(ilvls))}
+        for nid, ilvls in seen.items()
+    }
 
-def convert(file_path: str | Path, promote_heuristic_headers: bool = True) -> str:
-    doc = Document(str(file_path))
-    numbering = _NumberingTracker(doc)
-    depth_map = _build_depth_map(doc)
-    lines: list[str] = []
+    counters = {}
 
-    def blank():
-        if lines and lines[-1] != '':
-            lines.append('')
-
-    for element in doc.element.body:
-        if element.tag == qn('w:tbl'):
-            blank()
-            lines.append(_table_to_markdown(Table(element, doc)))
-            lines.append('')
+    for el in doc.element.body:
+        if el.tag == qn('w:tbl'):
+            yield {'kind': 'table', 'text': _table_md(Table(el, doc))}
+            continue
+        if el.tag != qn('w:p'):
             continue
 
-        if element.tag != qn('w:p'):
-            continue
-
-        para = Paragraph(element, doc)
+        para = Paragraph(el, doc)
         text = _format_runs(para)
+
         if not text.strip():
-            blank()
+            yield {'kind': 'blank'}
             continue
 
-        # explicit Heading style
-        style_level = _style_heading_level(para)
-        if style_level is not None:
-            blank()
-            lines.append(f"{'#' * style_level} {text.strip()}")
-            lines.append('')
+        # heading style
+        style = (para.style.name or '').lower()
+        hl = None
+        for i in range(1, 7):
+            if style.startswith(f'heading {i}'):
+                hl = i
+                break
+        if style == 'title':
+            hl = 1
+        elif style == 'subtitle':
+            hl = 2
+        if hl:
+            yield {'kind': 'heading', 'level': hl, 'text': text.strip()}
             continue
 
         # list item
-        list_info = numbering.resolve(para)
-        if list_info is not None:
-            num_id, ilvl, fmt, marker = list_info
-            d = depth_map.get(num_id, {}).get(ilvl, 1)
+        info = _numpr(el)
+        if info:
+            nid, il = info
+            levels = defs.get(nid, {})
+            lvl = levels.get(il)
 
-            if fmt == 'bullet':
-                lines.append('    ' * (d - 1) + '- ' + text.strip())
-                continue
+            # counter bookkeeping: reset deeper levels, bump or start this one
+            c = counters.setdefault(nid, {})
+            for k in [k for k in c if k > il]:
+                del c[k]
+            start = lvl['start'] if lvl else 1
+            c[il] = c[il] + 1 if il in c else start
 
-            prefix = '#' * min(d + _LIST_HEADING_OFFSET, 6)
-            body = text.strip()
-            blank()
-            lines.append(f'{prefix} {marker} {body}' if marker else f'{prefix} {body}')
-            lines.append('')
+            # generate marker
+            if lvl is None:
+                parts = [str(c[k]) for k in sorted(c) if k <= il]
+                marker, fmt = '.'.join(parts) + '.', 'decimal'
+            elif lvl['fmt'] == 'bullet':
+                marker, fmt = '', 'bullet'
+            else:
+                fmt = lvl['fmt']
+                marker = lvl['text']
+                for k in range(il + 1):
+                    if k in levels:
+                        v = c.get(k, levels[k]['start'])
+                        marker = marker.replace(
+                            f'%{k + 1}',
+                            _format_number(v, levels[k]['fmt']),
+                        )
+                marker = re.sub(r'%\d+', '', marker)
+
+            depth = depth_map.get(nid, {}).get(il, 1)
+            yield {
+                'kind': 'list', 'num_id': nid, 'ilvl': il,
+                'depth': depth, 'fmt': fmt, 'marker': marker,
+                'text': text.strip(),
+            }
             continue
 
-        # heuristic header for bold/large standalone paragraphs
-        if promote_heuristic_headers and _looks_like_header(para):
+        yield {'kind': 'body', 'text': text}
+
+
+# ---------------------------------------------------------------------------
+# Public API
+# ---------------------------------------------------------------------------
+
+def convert(path):
+    doc = Document(str(path))
+    out = []
+
+    def blank():
+        if out and out[-1] != '':
+            out.append('')
+
+    for item in _walk(doc):
+        k = item['kind']
+        if k == 'blank':
             blank()
-            lines.append(f'# {text.strip()}')
-            lines.append('')
+        elif k == 'table':
+            blank()
+            out.append(item['text'])
+            out.append('')
+        elif k == 'heading':
+            blank()
+            out.append('#' * item['level'] + ' ' + item['text'])
+            out.append('')
+        elif k == 'list':
+            if item['fmt'] == 'bullet':
+                out.append('    ' * (item['depth'] - 1) + '- ' + item['text'])
+            else:
+                prefix = '#' * min(item['depth'] + 1, 6)
+                if item['marker']:
+                    out.append(f'{prefix} {item["marker"]} {item["text"]}')
+                else:
+                    out.append(f'{prefix} {item["text"]}')
+                blank()
+        elif k == 'body':
+            out.append(item['text'])
+
+    return re.sub(r'\n{3,}', '\n\n', '\n'.join(out)).strip()
+
+
+def inspect(path):
+    """
+    Print everything the converter sees in the doc. Compare this against
+    the doc open in Word to find where it's getting confused.
+    """
+    doc = Document(str(path))
+
+    seen = {}
+    for p in doc.element.body.iter(qn('w:p')):
+        info = _numpr(p)
+        if info:
+            seen.setdefault(info[0], set()).add(info[1])
+    depth_map = {
+        nid: {il: rank + 1 for rank, il in enumerate(sorted(ilvls))}
+        for nid, ilvls in seen.items()
+    }
+
+    print('DEPTH MAP  (numId -> {raw_ilvl: assigned_depth})')
+    print('-' * 70)
+    for nid, m in depth_map.items():
+        print(f'  numId={nid}  :  {m}')
+    print()
+
+    print(f'{"kind":<6}  {"numId":<6}  {"ilvl":<4}  {"depth":<5}  {"marker":<10}  text')
+    print('-' * 100)
+    for item in _walk(doc):
+        k = item['kind']
+        if k == 'blank':
             continue
+        if k == 'list':
+            print(f'{"list":<6}  {item["num_id"]:<6}  {item["ilvl"]:<4}  '
+                  f'{item["depth"]:<5}  {item["marker"]:<10}  {item["text"][:70]}')
+        elif k == 'heading':
+            label = f'H{item["level"]}'
+            print(f'{label:<6}  {"":<6}  {"":<4}  {"":<5}  {"":<10}  {item["text"][:70]}')
+        elif k == 'body':
+            print(f'{"body":<6}  {"":<6}  {"":<4}  {"":<5}  {"":<10}  {item["text"][:70]}')
+        elif k == 'table':
+            print(f'{"table":<6}')
 
-        lines.append(text)
+    print()
+    print('MARKDOWN OUTPUT')
+    print('-' * 70)
+    print(convert(path))
 
-    return re.sub(r'\n{3,}', '\n\n', '\n'.join(lines)).strip()
+
+if __name__ == '__main__':
+    import sys
+    if len(sys.argv) < 2:
+        print('usage: python docx_to_md.py <path.docx> [--inspect]')
+        sys.exit(1)
+    if '--inspect' in sys.argv:
+        inspect(sys.argv[1])
+    else:
+        print(convert(sys.argv[1]))
