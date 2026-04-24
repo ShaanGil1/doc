@@ -1,19 +1,24 @@
 """
 Convert .docx to markdown.
 
-Core idea: walk the doc once, maintaining a stack of (numId, ilvl) pairs
-that represents the list contexts we're currently nested inside. Depth of
-any item is its position in that stack. When a new numId appears mid-flow,
-it pushes as a sub-list of whatever's on top. When a previous numId
-reappears, we pop back to it.
+Algorithm:
+    Pre-pass: record the last list position where each numId appears.
+    Main pass: walk the body with a stack of (num_id, ilvl). For each
+    list item, compute depth:
+        1. If (num_id, ilvl) already on stack -> truncate to it
+        2. Else if num_id on stack at a different ilvl -> pop back to
+           it, then push/replace based on whether the new ilvl is deeper
+           or shallower
+        3. Else (new num_id) -> first purge any stack entries whose
+           numId's last occurrence is before the current position
+           (those spans have ended), then push
 
-Example sequence of numIds: 1, 2, 2, 2, 1, 11, 11, 11, 1
-    see 1    -> push           [1]           depth 1
-    see 2    -> push            [1, 2]       depth 2  (sub of 1)
-    see 2,2  -> stay            [1, 2]       depth 2
-    see 1    -> pop back        [1]          depth 1
-    see 11   -> push            [1, 11]      depth 2  (sub of 1)
-    see 1    -> pop back        [1]          depth 1
+The pre-pass is the "look-ahead" that lets us tell whether a numId
+still has more items coming or if its span has already ended.
+
+Two entry points:
+    convert(path)  -> markdown string
+    inspect(path)  -> prints the diagnostic walk
 """
 
 import re
@@ -24,7 +29,6 @@ from docx.oxml.ns import qn
 
 
 def _numpr(pe):
-    """If paragraph is a list item, return (num_id, ilvl). Else None."""
     pPr = pe.find(qn('w:pPr'))
     if pPr is None:
         return None
@@ -90,47 +94,87 @@ def _table_md(table):
     return '\n'.join(lines)
 
 
-def _walk(doc):
-    """Yield one dict per body item: table, heading, list, body, or blank."""
+def _scan_lists(doc):
+    """
+    First pass: walk direct body paragraphs in order, return two things:
+      - last_pos: {num_id: last list-index where it appeared}
+      - parents:  set of num_ids that have another num_id's first occurrence
+                  strictly inside their span (first..last)
+    """
+    occurrences = {}
+    pos = 0
+    for el in doc.element.body:
+        if el.tag != qn('w:p'):
+            continue
+        info = _numpr(el)
+        if info:
+            occurrences.setdefault(info[0], []).append(pos)
+            pos += 1
 
-    # load numbering.xml so we can render marker text (1., a., 1.1, etc.)
+    last_pos = {nid: idxs[-1] for nid, idxs in occurrences.items()}
+    parents = set()
+    for nid, idxs in occurrences.items():
+        first, last = idxs[0], idxs[-1]
+        for other_nid, other_idxs in occurrences.items():
+            if other_nid != nid and any(first < i < last for i in other_idxs):
+                parents.add(nid)
+                break
+    return last_pos, parents
+
+
+def _load_numbering_defs(doc):
     defs = {}
     try:
         part = doc.part.numbering_part
     except Exception:
         part = None
-    if part is not None:
-        abs_defs = {}
-        for a in part.element.findall(qn('w:abstractNum')):
-            lvls = {}
-            for l in a.findall(qn('w:lvl')):
-                il = int(l.get(qn('w:ilvl'), '0'))
-                f = l.find(qn('w:numFmt'))
-                t = l.find(qn('w:lvlText'))
-                s = l.find(qn('w:start'))
-                lvls[il] = {
-                    'fmt': f.get(qn('w:val')) if f is not None else 'decimal',
-                    'text': t.get(qn('w:val')) if t is not None else f'%{il + 1}.',
-                    'start': int(s.get(qn('w:val'))) if s is not None else 1,
-                }
-            abs_defs[a.get(qn('w:abstractNumId'))] = lvls
-        for n in part.element.findall(qn('w:num')):
-            r = n.find(qn('w:abstractNumId'))
-            if r is not None and r.get(qn('w:val')) in abs_defs:
-                defs[n.get(qn('w:numId'))] = abs_defs[r.get(qn('w:val'))]
+    if part is None:
+        return defs
+    abs_defs = {}
+    for a in part.element.findall(qn('w:abstractNum')):
+        lvls = {}
+        for l in a.findall(qn('w:lvl')):
+            il = int(l.get(qn('w:ilvl'), '0'))
+            f = l.find(qn('w:numFmt'))
+            t = l.find(qn('w:lvlText'))
+            s = l.find(qn('w:start'))
+            lvls[il] = {
+                'fmt': f.get(qn('w:val')) if f is not None else 'decimal',
+                'text': t.get(qn('w:val')) if t is not None else f'%{il + 1}.',
+                'start': int(s.get(qn('w:val'))) if s is not None else 1,
+            }
+        abs_defs[a.get(qn('w:abstractNumId'))] = lvls
+    for n in part.element.findall(qn('w:num')):
+        r = n.find(qn('w:abstractNumId'))
+        if r is not None and r.get(qn('w:val')) in abs_defs:
+            defs[n.get(qn('w:numId'))] = abs_defs[r.get(qn('w:val'))]
+    return defs
 
-    # stack of (num_id, ilvl) representing nesting path
-    stack = []
-    counters = {}  # num_id -> {ilvl: count}
+
+def _walk(doc):
+    defs = _load_numbering_defs(doc)
+    last_pos, parents = _scan_lists(doc)
+
+    stack = []          # list of (num_id, ilvl)
+    counters = {}       # num_id -> {ilvl: count}
+    list_pos = 0        # current list-item index
 
     def compute_depth(nid, il):
         entry = (nid, il)
-        # exact match on stack -> truncate to it
+        # (1) exact match on stack -> truncate to it
         for i in range(len(stack) - 1, -1, -1):
             if stack[i] == entry:
                 del stack[i + 1:]
                 return i + 1
-        # numId on stack at a different ilvl -> pop back to it, then push or replace
+        # (2) this is a NEW parent numId and everything on the stack is already
+        # dead (its last occurrence is before this position) -> the prior list
+        # world is over, start fresh at depth 1
+        if nid in parents and not any(s[0] == nid for s in stack):
+            if not any(last_pos.get(s[0], -1) >= list_pos for s in stack):
+                stack.clear()
+                stack.append(entry)
+                return 1
+        # (3) same numId at different ilvl -> pop back to it, then push/replace
         for i in range(len(stack) - 1, -1, -1):
             if stack[i][0] == nid:
                 del stack[i + 1:]
@@ -140,7 +184,8 @@ def _walk(doc):
                 else:
                     stack[-1] = entry
                 return len(stack)
-        # new numId entirely -> push as sub-list of current top
+        # (4) completely new numId (non-parent, or parent with still-alive
+        # contexts on the stack) -> push as sub-list of current top
         stack.append(entry)
         return len(stack)
 
@@ -187,7 +232,7 @@ def _walk(doc):
             start = lvl['start'] if lvl else 1
             c[il] = c[il] + 1 if il in c else start
 
-            # render marker text (1., a., 1.1., etc.)
+            # marker text
             if lvl is None:
                 parts = [str(c[k]) for k in sorted(c) if k <= il]
                 marker, fmt = '.'.join(parts) + '.', 'decimal'
@@ -206,6 +251,7 @@ def _walk(doc):
                 marker = re.sub(r'%\d+', '', marker)
 
             d = compute_depth(nid, il)
+            list_pos += 1
             yield {
                 'kind': 'list', 'num_id': nid, 'ilvl': il,
                 'depth': d, 'fmt': fmt, 'marker': marker,
@@ -254,6 +300,15 @@ def convert(path):
 
 def inspect(path):
     doc = Document(str(path))
+    last_pos, parents = _scan_lists(doc)
+
+    print('NUMID SUMMARY  (parent = has another numId inside its span)')
+    print('-' * 70)
+    for nid in sorted(last_pos, key=lambda n: last_pos[n]):
+        tag = 'parent' if nid in parents else 'sub'
+        print(f'  numId {nid:<6}  last at list-pos {last_pos[nid]:<4}  ({tag})')
+    print()
+
     print(f'{"kind":<6}  {"numId":<6}  {"ilvl":<4}  {"depth":<5}  {"marker":<10}  text')
     print('-' * 100)
     for item in _walk(doc):
