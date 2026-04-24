@@ -1,3 +1,4 @@
+```python
 """
 Document sectioning via docling + AI.
 
@@ -529,3 +530,4 @@ def split_markdown(
 #         cleaned = [_MD_SYNTAX_RE.sub("", l).strip() for l in lines[start:end]]
 #         result.append({"title": section.title, "content": "\n".join(c for c in cleaned if c)})
 #     return result
+```
