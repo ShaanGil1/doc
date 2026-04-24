@@ -1,18 +1,19 @@
 """
 Convert .docx to markdown.
 
-Two entry points:
-    convert(path)  -> returns the markdown string
-    inspect(path)  -> prints what the converter sees in the doc,
-                      useful for debugging when the output looks wrong
+Core idea: walk the doc once, maintaining a stack of (numId, ilvl) pairs
+that represents the list contexts we're currently nested inside. Depth of
+any item is its position in that stack. When a new numId appears mid-flow,
+it pushes as a sub-list of whatever's on top. When a previous numId
+reappears, we pop back to it.
 
-The algorithm:
-    1. Load numbering.xml so we can generate marker text (1., a., 1.1, etc.)
-    2. Build a depth map: for each numId, rank the ilvls that actually
-       appear and assign depth = rank + 1. Each numId chain is independent
-       and starts at depth 1.
-    3. Walk the body. For each list paragraph, look up its depth in the
-       map and emit `#` * (depth + 1) + marker + text.
+Example sequence of numIds: 1, 2, 2, 2, 1, 11, 11, 11, 1
+    see 1    -> push           [1]           depth 1
+    see 2    -> push            [1, 2]       depth 2  (sub of 1)
+    see 2,2  -> stay            [1, 2]       depth 2
+    see 1    -> pop back        [1]          depth 1
+    see 11   -> push            [1, 11]      depth 2  (sub of 1)
+    see 1    -> pop back        [1]          depth 1
 """
 
 import re
@@ -22,40 +23,36 @@ from docx.text.paragraph import Paragraph
 from docx.oxml.ns import qn
 
 
-# ---------------------------------------------------------------------------
-# Low-level helpers
-# ---------------------------------------------------------------------------
-
-def _numpr(para_elem):
-    """If paragraph is a list item, return (num_id, ilvl). Otherwise None."""
-    pPr = para_elem.find(qn('w:pPr'))
+def _numpr(pe):
+    """If paragraph is a list item, return (num_id, ilvl). Else None."""
+    pPr = pe.find(qn('w:pPr'))
     if pPr is None:
         return None
-    numPr = pPr.find(qn('w:numPr'))
-    if numPr is None:
+    np = pPr.find(qn('w:numPr'))
+    if np is None:
         return None
-    nid_el = numPr.find(qn('w:numId'))
+    nid_el = np.find(qn('w:numId'))
     if nid_el is None:
         return None
     nid = nid_el.get(qn('w:val'))
     if nid == '0':
         return None
-    il_el = numPr.find(qn('w:ilvl'))
-    ilvl = int(il_el.get(qn('w:val'), '0')) if il_el is not None else 0
-    return (nid, ilvl)
+    il_el = np.find(qn('w:ilvl'))
+    il = int(il_el.get(qn('w:val'), '0')) if il_el is not None else 0
+    return (nid, il)
 
 
-def _format_number(value, fmt):
-    if fmt == 'lowerLetter' and value <= 26:
-        return chr(ord('a') + value - 1)
-    if fmt == 'upperLetter' and value <= 26:
-        return chr(ord('A') + value - 1)
-    return str(value)
+def _format_number(v, fmt):
+    if fmt == 'lowerLetter' and v <= 26:
+        return chr(ord('a') + v - 1)
+    if fmt == 'upperLetter' and v <= 26:
+        return chr(ord('A') + v - 1)
+    return str(v)
 
 
-def _format_runs(paragraph):
+def _format_runs(para):
     parts = []
-    for r in paragraph.runs:
+    for r in para.runs:
         t = r.text
         if not t:
             continue
@@ -73,7 +70,7 @@ def _format_runs(paragraph):
             parts.append(f'{lead}*{inner}*{trail}')
         else:
             parts.append(t)
-    result = ''.join(parts) if parts else paragraph.text
+    result = ''.join(parts) if parts else para.text
     result = re.sub(r'\*\*\*\*\*\*', '', result)
     result = re.sub(r'\*\*\*\*', '', result)
     return result
@@ -85,20 +82,18 @@ def _table_md(table):
         return ''
     cols = max(len(r) for r in rows)
     pad = lambda r: (r + [''] * (cols - len(r)))[:cols]
-    out = [
+    lines = [
         '| ' + ' | '.join(pad(rows[0])) + ' |',
         '| ' + ' | '.join('---' for _ in range(cols)) + ' |',
     ]
-    out += ['| ' + ' | '.join(pad(r)) + ' |' for r in rows[1:]]
-    return '\n'.join(out)
+    lines += ['| ' + ' | '.join(pad(r)) + ' |' for r in rows[1:]]
+    return '\n'.join(lines)
 
-
-# ---------------------------------------------------------------------------
-# The core walk: yields one dict per body item
-# ---------------------------------------------------------------------------
 
 def _walk(doc):
-    # load numbering definitions
+    """Yield one dict per body item: table, heading, list, body, or blank."""
+
+    # load numbering.xml so we can render marker text (1., a., 1.1, etc.)
     defs = {}
     try:
         part = doc.part.numbering_part
@@ -124,18 +119,30 @@ def _walk(doc):
             if r is not None and r.get(qn('w:val')) in abs_defs:
                 defs[n.get(qn('w:numId'))] = abs_defs[r.get(qn('w:val'))]
 
-    # build depth map: rank ilvls within each numId
-    seen = {}
-    for p in doc.element.body.iter(qn('w:p')):
-        info = _numpr(p)
-        if info:
-            seen.setdefault(info[0], set()).add(info[1])
-    depth_map = {
-        nid: {il: rank + 1 for rank, il in enumerate(sorted(ilvls))}
-        for nid, ilvls in seen.items()
-    }
+    # stack of (num_id, ilvl) representing nesting path
+    stack = []
+    counters = {}  # num_id -> {ilvl: count}
 
-    counters = {}
+    def compute_depth(nid, il):
+        entry = (nid, il)
+        # exact match on stack -> truncate to it
+        for i in range(len(stack) - 1, -1, -1):
+            if stack[i] == entry:
+                del stack[i + 1:]
+                return i + 1
+        # numId on stack at a different ilvl -> pop back to it, then push or replace
+        for i in range(len(stack) - 1, -1, -1):
+            if stack[i][0] == nid:
+                del stack[i + 1:]
+                top_il = stack[-1][1]
+                if il > top_il:
+                    stack.append(entry)
+                else:
+                    stack[-1] = entry
+                return len(stack)
+        # new numId entirely -> push as sub-list of current top
+        stack.append(entry)
+        return len(stack)
 
     for el in doc.element.body:
         if el.tag == qn('w:tbl'):
@@ -173,14 +180,14 @@ def _walk(doc):
             levels = defs.get(nid, {})
             lvl = levels.get(il)
 
-            # counter bookkeeping: reset deeper levels, bump or start this one
+            # counter bookkeeping for marker rendering
             c = counters.setdefault(nid, {})
             for k in [k for k in c if k > il]:
                 del c[k]
             start = lvl['start'] if lvl else 1
             c[il] = c[il] + 1 if il in c else start
 
-            # generate marker
+            # render marker text (1., a., 1.1., etc.)
             if lvl is None:
                 parts = [str(c[k]) for k in sorted(c) if k <= il]
                 marker, fmt = '.'.join(parts) + '.', 'decimal'
@@ -198,20 +205,16 @@ def _walk(doc):
                         )
                 marker = re.sub(r'%\d+', '', marker)
 
-            depth = depth_map.get(nid, {}).get(il, 1)
+            d = compute_depth(nid, il)
             yield {
                 'kind': 'list', 'num_id': nid, 'ilvl': il,
-                'depth': depth, 'fmt': fmt, 'marker': marker,
+                'depth': d, 'fmt': fmt, 'marker': marker,
                 'text': text.strip(),
             }
             continue
 
         yield {'kind': 'body', 'text': text}
 
-
-# ---------------------------------------------------------------------------
-# Public API
-# ---------------------------------------------------------------------------
 
 def convert(path):
     doc = Document(str(path))
@@ -250,28 +253,7 @@ def convert(path):
 
 
 def inspect(path):
-    """
-    Print everything the converter sees in the doc. Compare this against
-    the doc open in Word to find where it's getting confused.
-    """
     doc = Document(str(path))
-
-    seen = {}
-    for p in doc.element.body.iter(qn('w:p')):
-        info = _numpr(p)
-        if info:
-            seen.setdefault(info[0], set()).add(info[1])
-    depth_map = {
-        nid: {il: rank + 1 for rank, il in enumerate(sorted(ilvls))}
-        for nid, ilvls in seen.items()
-    }
-
-    print('DEPTH MAP  (numId -> {raw_ilvl: assigned_depth})')
-    print('-' * 70)
-    for nid, m in depth_map.items():
-        print(f'  numId={nid}  :  {m}')
-    print()
-
     print(f'{"kind":<6}  {"numId":<6}  {"ilvl":<4}  {"depth":<5}  {"marker":<10}  text')
     print('-' * 100)
     for item in _walk(doc):
@@ -288,19 +270,7 @@ def inspect(path):
             print(f'{"body":<6}  {"":<6}  {"":<4}  {"":<5}  {"":<10}  {item["text"][:70]}')
         elif k == 'table':
             print(f'{"table":<6}')
-
     print()
     print('MARKDOWN OUTPUT')
     print('-' * 70)
     print(convert(path))
-
-
-if __name__ == '__main__':
-    import sys
-    if len(sys.argv) < 2:
-        print('usage: python docx_to_md.py <path.docx> [--inspect]')
-        sys.exit(1)
-    if '--inspect' in sys.argv:
-        inspect(sys.argv[1])
-    else:
-        print(convert(sys.argv[1]))
