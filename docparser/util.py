@@ -165,11 +165,12 @@ def compute_list_markers(doc):
     if not numbering_map:
         return []
 
-    # Top-level (ilvl=0) uses a single global counter across all numIds, since
-    # docs frequently split visually-continuous lists into many numIds. Sub-levels
-    # stay per-numId so each section's a/b/c restarts properly.
+    # Counters are per-(num_id, ilvl). When the LLM splits the doc into sections
+    # downstream, each section is rendered independently, so the user sees fresh
+    # restarted numbering per section - which is what they want. We deliberately
+    # do NOT use a global counter across the whole doc, because that produces
+    # silly numbers like '47.' showing up in section 5 after 46 prior items.
     counters = {}
-    global_top_counter = 0
     seen_restarts = set()
     results = []
     for paragraph in doc.paragraphs:
@@ -201,29 +202,21 @@ def compute_list_markers(doc):
             counters.pop((num_id, ilvl), None)
             seen_restarts.add(restart_key)
 
-        # Reset deeper-level counters when this level advances
+        # Reset deeper-level counters within this num_id when this level advances
         for existing_key in list(counters.keys()):
             if existing_key[0] == num_id and existing_key[1] > ilvl:
                 del counters[existing_key]
 
-        # Increment this level's counter. Top-level uses the global counter;
-        # sub-levels use per-numId counters as before.
-        if ilvl == 0:
-            global_top_counter += 1
-            counters[(num_id, 0)] = global_top_counter
-        else:
-            counter_key = (num_id, ilvl)
-            counters[counter_key] = counters.get(counter_key, levels[ilvl]['start'] - 1) + 1
+        # Increment this level's counter
+        counter_key = (num_id, ilvl)
+        counters[counter_key] = counters.get(counter_key, levels[ilvl]['start'] - 1) + 1
 
         # Render lvlText template, substituting %1, %2, ... with formatted counters
         marker = levels[ilvl]['lvlText']
         for level_index in range(ilvl + 1):
             if level_index not in levels:
                 continue
-            if level_index == 0:
-                counter_value = global_top_counter
-            else:
-                counter_value = counters.get((num_id, level_index), levels[level_index]['start'])
+            counter_value = counters.get((num_id, level_index), levels[level_index]['start'])
             marker = marker.replace(
                 f'%{level_index + 1}',
                 format_list_number(counter_value, levels[level_index]['numFmt']),
