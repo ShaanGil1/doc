@@ -667,3 +667,57 @@ if __name__ == "__main__":
         ok = run_qa()
         sys.exit(0 if ok else 1)
 ```
+project/
+├── shared/
+│   ├── state.py                  BaseState shared across subgraphs
+│   └── tasks.py                  WriterTask (unified dispatch object)
+│
+├── writer/
+│   ├── state.py                  WriterSubgraphState
+│   ├── graph.py                  Writer subgraph wiring
+│   ├── supervisor.py             Entry/finalize nodes
+│   │
+│   ├── enhancement/
+│   │   ├── router.py             LLM router for user-input path
+│   │   └── prompts.py            Router prompt templates
+│   │
+│   ├── feedback/
+│   │   └── dispatch.py           rule_id/category → sub-agent lookup
+│   │
+│   └── sub_agents/
+│       ├── registry.py           Single source of truth: name, description, contract
+│       ├── base.py               Shared sub-agent base/factory
+│       ├── tone_adjuster.py
+│       ├── formatter.py
+│       ├── summarizer.py
+│       ├── consistency_checker.py
+│       ├── style_guide_writer.py
+│       ├── content_critique.py
+│       ├── citation_handler.py
+│       └── spelling_agent.py
+│
+├── reviewer/
+│   ├── state.py                  ReviewerSubgraphState
+│   ├── graph.py                  Reviewer subgraph wiring
+│   ├── supervisor.py             Entry/finalize nodes
+│   ├── models.py                 RuleViolation, ReviewerNote
+│   │
+│   ├── rules/
+│   │   ├── registry.py           rule_id → metadata (incl. fixing sub-agent)
+│   │   └── checks/               Individual rule check implementations
+│   │
+│   └── sub_agents/
+│       ├── registry.py           Reviewer-side sub-agent registry
+│       ├── base.py               Shared base/factory
+│       ├── spelling_checker.py
+│       ├── tone_checker.py
+│       ├── consistency_checker.py
+│       ├── style_guide_checker.py
+│       ├── citation_checker.py
+│       └── content_checker.py
+│
+├── orchestrator/
+│   ├── graph.py                  Top-level graph, owns writer ↔ reviewer loop
+│   └── triggers.py               Entry triggers: user-input vs reviewer-flag
+│
+└── run_example.py
