@@ -113,6 +113,13 @@ def word_list_level(paragraph):
 # substitute the correct markers back into the markdown.
 
 LIST_LINE_PATTERN = re.compile(r'^(\s*)(\d+)\.\s+(.*)$')
+# Lines markdownify produced with stacked-marker noise like '* + 1.' or '* 1.'.
+# Requires both a bullet-noise prefix AND a numbered marker, so plain bullets
+# don't get caught and incorrectly rewritten.
+NOISY_LIST_LINE_PATTERN = re.compile(r'^(\s*)(?:[*+\-]\s+)+\d+\.\s+(.*)$')
+
+INDENT_PER_LEVEL = 3        # spaces per ilvl
+MATCH_SNIPPET_LENGTH = 15   # chars of content to compare when matching docx paragraph to markdown line
 
 
 # Replace markdownify's flat numbering with the actual Word markers
@@ -123,32 +130,47 @@ def apply_word_list_markers(markdown, doc):
 
     lines = markdown.split('\n')
     cursor = 0
-    for marker, paragraph_text in paragraph_markers:
+    for marker, ilvl, paragraph_text in paragraph_markers:
         snippet = paragraph_text[:30].lower()
         if not snippet:
             continue
-        # Find the next list line whose content matches this paragraph
-        for i in range(cursor, len(lines)):
-            match = LIST_LINE_PATTERN.match(lines[i])
-            if not match:
+        # Find the next list-ish line whose content matches this paragraph.
+        # Try clean numbered first, then noisy (e.g. '* + 1. text').
+        for line_index in range(cursor, len(lines)):
+            line = lines[line_index]
+            clean_match = LIST_LINE_PATTERN.match(line)
+            noisy_match = NOISY_LIST_LINE_PATTERN.match(line) if not clean_match else None
+            if not clean_match and not noisy_match:
                 continue
-            indent, _, content = match.groups()
+            if clean_match:
+                content = clean_match.group(3)
+            else:
+                content = noisy_match.group(2)
+            # Strip markdown formatting before comparing to the docx paragraph text
             content_plain = re.sub(r'<[^>]+>|\*+|\[|\]\([^)]*\)', '', content).lower()
-            if snippet[:15] in content_plain or content_plain[:15] in snippet:
-                lines[i] = f'{indent}{marker} {content}'
-                cursor = i + 1
+            if (snippet[:MATCH_SNIPPET_LENGTH] in content_plain or
+                content_plain[:MATCH_SNIPPET_LENGTH] in snippet):
+                # Force consistent indent based on real ilvl, ignoring whatever
+                # markdownify produced. Strips the bullet noise too.
+                indent = ' ' * (INDENT_PER_LEVEL * ilvl)
+                lines[line_index] = f'{indent}{marker} {content}'
+                cursor = line_index + 1
                 break
     return '\n'.join(lines)
 
 
-# Walk paragraphs, return [(marker, text), ...] for every numbered (non-bullet) one
+# Walk paragraphs, return [(marker, ilvl, text), ...] for every numbered (non-bullet) one
 def compute_list_markers(doc):
     numbering_map = build_numbering_map(doc)
     if not numbering_map:
         return []
 
+    # Top-level (ilvl=0) uses a single global counter across all numIds, since
+    # docs frequently split visually-continuous lists into many numIds. Sub-levels
+    # stay per-numId so each section's a/b/c restarts properly.
     counters = {}
-    seen_restarts = set()  # (num_id, ilvl) pairs we've already restarted
+    global_top_counter = 0
+    seen_restarts = set()
     results = []
     for paragraph in doc.paragraphs:
         para_props = paragraph._p.find(qn('w:pPr'))
@@ -180,23 +202,34 @@ def compute_list_markers(doc):
             seen_restarts.add(restart_key)
 
         # Reset deeper-level counters when this level advances
-        for key in list(counters.keys()):
-            if key[0] == num_id and key[1] > ilvl:
-                del counters[key]
+        for existing_key in list(counters.keys()):
+            if existing_key[0] == num_id and existing_key[1] > ilvl:
+                del counters[existing_key]
 
-        # Increment this level's counter
-        counter_key = (num_id, ilvl)
-        counters[counter_key] = counters.get(counter_key, levels[ilvl]['start'] - 1) + 1
+        # Increment this level's counter. Top-level uses the global counter;
+        # sub-levels use per-numId counters as before.
+        if ilvl == 0:
+            global_top_counter += 1
+            counters[(num_id, 0)] = global_top_counter
+        else:
+            counter_key = (num_id, ilvl)
+            counters[counter_key] = counters.get(counter_key, levels[ilvl]['start'] - 1) + 1
 
         # Render lvlText template, substituting %1, %2, ... with formatted counters
         marker = levels[ilvl]['lvlText']
         for level_index in range(ilvl + 1):
             if level_index not in levels:
                 continue
-            n = counters.get((num_id, level_index), levels[level_index]['start'])
-            marker = marker.replace(f'%{level_index + 1}', format_list_number(n, levels[level_index]['numFmt']))
+            if level_index == 0:
+                counter_value = global_top_counter
+            else:
+                counter_value = counters.get((num_id, level_index), levels[level_index]['start'])
+            marker = marker.replace(
+                f'%{level_index + 1}',
+                format_list_number(counter_value, levels[level_index]['numFmt']),
+            )
 
-        results.append((marker, paragraph.text.strip()))
+        results.append((marker, ilvl, paragraph.text.strip()))
 
     return results
 
@@ -224,17 +257,17 @@ def build_numbering_map(doc):
         abstract_defs[abstract_num_id] = levels
 
     result = {}
-    for num in numbering_part.element.findall(qn('w:num')):
-        num_id = num.get(qn('w:numId'))
-        ref = num.find(qn('w:abstractNumId'))
-        if ref is None:
+    for num_def in numbering_part.element.findall(qn('w:num')):
+        num_id = num_def.get(qn('w:numId'))
+        abstract_ref = num_def.find(qn('w:abstractNumId'))
+        if abstract_ref is None:
             continue
-        abstract_num_id = ref.get(qn('w:val'))
+        abstract_num_id = abstract_ref.get(qn('w:val'))
         levels = dict(abstract_defs.get(abstract_num_id, {}))
 
         # Look for lvlOverride entries that signal "restart at this level"
         restart_levels = set()
-        for override in num.findall(qn('w:lvlOverride')):
+        for override in num_def.findall(qn('w:lvlOverride')):
             ilvl = int(override.get(qn('w:ilvl')))
             start_override = override.find(qn('w:startOverride'))
             if start_override is None:
@@ -251,42 +284,42 @@ def build_numbering_map(doc):
 
 
 # Render an int per Word's various numbering formats
-def format_list_number(n, num_fmt):
+def format_list_number(value, num_fmt):
     if num_fmt == 'decimal':
-        return str(n)
+        return str(value)
     if num_fmt == 'lowerLetter':
-        return _to_lower_letter(n)
+        return _to_lower_letter(value)
     if num_fmt == 'upperLetter':
-        return _to_lower_letter(n).upper()
+        return _to_lower_letter(value).upper()
     if num_fmt == 'lowerRoman':
-        return _to_lower_roman(n)
+        return _to_lower_roman(value)
     if num_fmt == 'upperRoman':
-        return _to_lower_roman(n).upper()
-    return str(n)
+        return _to_lower_roman(value).upper()
+    return str(value)
 
 
 # 1=a, 2=b, ..., 26=z, 27=aa, 28=ab
-def _to_lower_letter(n):
-    if n <= 0:
+def _to_lower_letter(value):
+    if value <= 0:
         return ''
     result = ''
-    while n > 0:
-        n -= 1
-        result = chr(ord('a') + n % 26) + result
-        n //= 26
+    while value > 0:
+        value -= 1
+        result = chr(ord('a') + value % 26) + result
+        value //= 26
     return result
 
 
 # 1=i, 2=ii, 4=iv, 9=ix, ...
-def _to_lower_roman(n):
+def _to_lower_roman(value):
     pairs = [(1000, 'm'), (900, 'cm'), (500, 'd'), (400, 'cd'),
              (100, 'c'), (90, 'xc'), (50, 'l'), (40, 'xl'),
              (10, 'x'), (9, 'ix'), (5, 'v'), (4, 'iv'), (1, 'i')]
     result = ''
-    for value, symbol in pairs:
-        while n >= value:
+    for amount, symbol in pairs:
+        while value >= amount:
             result += symbol
-            n -= value
+            value -= amount
     return result
 
 
