@@ -1,35 +1,81 @@
-if column_type == "tsvector":
-tsvector_col = schema["tsvector_col"]
-if not tsvector_col:
-    raise HTTPException(400, f"table has no tsvector column for {condition.column!r}")
-placeholder = bind(condition.value)
-fragments.append(f'"{tsvector_col}" @@ websearch_to_tsquery(\'english\', {placeholder})')
-# NEW: capture the rank expression, reusing the same bound param
-rank_exprs.append(
-    f'ts_rank_cd("{tsvector_col}", websearch_to_tsquery(\'english\', {placeholder}), 32)'
-)
+async def search_documents(...):
+    '''
+    Search document metadata.
 
-return fragments, params, rank_exprs
+    Filterable columns:
 
-
-
-def build_sql(schema: dict, query: SearchQuery) -> tuple[str, dict, str, dict]:
-    fragments, where_params, rank_exprs = build_where(schema, query.conditions)
+    | Column | Type | Supported Operators |
+    | --- | --- | --- |
+    | document_id | uuid | eq, neq, lt, lte, gt, gte, in, not_in, like, ilike |
+    | document_name | text | eq, neq, lt, lte, gt, gte, in, not_in, like, ilike |
+    | document_number | text | eq, neq, lt, lte, gt, gte, in, not_in, like, ilike |
+    | document_type | text | eq, neq, lt, lte, gt, gte, in, not_in, like, ilike |
+    | fiscal_year | int | eq, neq, lt, lte, gt, gte, in, not_in, like, ilike |
+    | dates_referenced | array[date] | eq, contains_any, contains_all, contains_none, is_empty, not_empty |
+    | file_name | text | eq, neq, lt, lte, gt, gte, in, not_in, like, ilike |
+    | document_synonyms | array[text] | eq, contains_any, contains_all, contains_none, is_empty, not_empty |
+    | document_summary | text | eq, neq, lt, lte, gt, gte, in, not_in, like, ilike |
+    | document_created | date | eq, neq, lt, lte, gt, gte, in, not_in, like, ilike |
+    | version | text | eq, neq, lt, lte, gt, gte, in, not_in, like, ilike |
+    | document_description | text | eq, neq, lt, lte, gt, gte, in, not_in, like, ilike |
+    | policies | array[text] | eq, contains_any, contains_all, contains_none, is_empty, not_empty |
+    | is_latest | bool | eq, neq, lt, lte, gt, gte, in, not_in, like, ilike |
+    | enabled | bool | eq, neq, lt, lte, gt, gte, in, not_in, like, ilike |
+    | entities | array[text] | eq, contains_any, contains_all, contains_none, is_empty, not_empty |
+    | topics | array[text] | eq, contains_any, contains_all, contains_none, is_empty, not_empty |
+    '''
     
-    # ... existing select cols logic ...
-    select_cols = [...]  # whatever you already build
+async def search_chunks(...):
+    '''
+    Search chunk metadata.
 
-    # NEW: add score column if any tsvector matches present
-    if rank_exprs:
-        # If multiple matches, sum the ranks
-        score_expr = " + ".join(rank_exprs) if len(rank_exprs) > 1 else rank_exprs[0]
-        select_clause = f"SELECT {', '.join(select_cols)}, {score_expr} AS _score"
-        order_clause = "ORDER BY _score DESC"
-    else:
-        select_clause = f"SELECT {', '.join(select_cols)}"
-        order_clause = ""  # or your existing default ordering
+    Filterable columns:
 
-    where_clause = f"WHERE {' AND '.join(fragments)}" if fragments else ""
-    
-    data_sql = f"{select_clause} FROM {schema['table']} {where_clause} {order_clause} LIMIT %(limit)s OFFSET %(offset)s"
-    # count_sql stays the same, no rank/order needed for counting
+    | Column | Type | Supported Operators |
+    | --- | --- | --- |
+    | chunk_id | uuid | eq, neq, lt, lte, gt, gte, in, not_in, like, ilike |
+    | document_id | uuid | eq, neq, lt, lte, gt, gte, in, not_in, like, ilike |
+    | chunk_file | uuid | eq, neq, lt, lte, gt, gte, in, not_in, like, ilike |
+    | file_name | text | eq, neq, lt, lte, gt, gte, in, not_in, like, ilike |
+    | pages | array[int] | eq, contains_any, contains_all, contains_none, is_empty, not_empty |
+    | document_name | text | eq, neq, lt, lte, gt, gte, in, not_in, like, ilike |
+    | chunking_strategy | text | eq, neq, lt, lte, gt, gte, in, not_in, like, ilike |
+    | chunk_text_markdown | text | eq, neq, lt, lte, gt, gte, in, not_in, like, ilike |
+    | entities | array[text] | eq, contains_any, contains_all, contains_none, is_empty, not_empty |
+    | key_phrases | array[text] | eq, contains_any, contains_all, contains_none, is_empty, not_empty |
+    | bounding_box | array[float] | eq, contains_any, contains_all, contains_none, is_empty, not_empty |
+    | content_summary | text | eq, neq, lt, lte, gt, gte, in, not_in, like, ilike |
+    | version | text | eq, neq, lt, lte, gt, gte, in, not_in, like, ilike |
+    | is_latest | bool | eq, neq, lt, lte, gt, gte, in, not_in, like, ilike |
+    | enabled | bool | eq, neq, lt, lte, gt, gte, in, not_in, like, ilike |
+    | parent_document_type | text | eq, neq, lt, lte, gt, gte, in, not_in, like, ilike |
+    | tables | array[text] | eq, contains_any, contains_all, contains_none, is_empty, not_empty |
+    | images | array[float] | eq, contains_any, contains_all, contains_none, is_empty, not_empty |
+    | chunk_text_search_tsvector | tsvector | matches |
+    '''
+
+async def search_facts(...):
+    '''
+    Search the fact table (document-level topics and date ranges).
+
+    Filterable columns:
+
+    | Column | Type | Supported Operators |
+    | --- | --- | --- |
+    | topic_id | uuid | eq, neq, lt, lte, gt, gte, in, not_in, like, ilike |
+    | document_id | uuid | eq, neq, lt, lte, gt, gte, in, not_in, like, ilike |
+    | chunk_id | uuid | eq, neq, lt, lte, gt, gte, in, not_in, like, ilike |
+    | topic | text | eq, neq, lt, lte, gt, gte, in, not_in, like, ilike |
+    | topic_type | text | eq, neq, lt, lte, gt, gte, in, not_in, like, ilike |
+    | key_information | text | eq, neq, lt, lte, gt, gte, in, not_in, like, ilike |
+    | topic_fiscal_year | int | eq, neq, lt, lte, gt, gte, in, not_in, like, ilike |
+    | topic_confidence | int | eq, neq, lt, lte, gt, gte, in, not_in, like, ilike |
+    | topic_dates_referenced | array[date] | eq, contains_any, contains_all, contains_none, is_empty, not_empty |
+    | authority_level | text | eq, neq, lt, lte, gt, gte, in, not_in, like, ilike |
+    | document_version | text | eq, neq, lt, lte, gt, gte, in, not_in, like, ilike |
+    | is_latest | bool | eq, neq, lt, lte, gt, gte, in, not_in, like, ilike |
+    | start_date | date | eq, neq, lt, lte, gt, gte, in, not_in, like, ilike |
+    | end_date | date | eq, neq, lt, lte, gt, gte, in, not_in, like, ilike |
+    | category | text | eq, neq, lt, lte, gt, gte, in, not_in, like, ilike |
+    | topic_keyword_search_tsvector | tsvector | matches |
+    '''
