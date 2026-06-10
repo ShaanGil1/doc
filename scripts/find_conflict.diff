@@ -1,0 +1,958 @@
+Only in work/find_conflict: .pytest_cache
+diff -ru -x __pycache__ -x '*.pyc' orig/find_conflict/graph.py work/find_conflict/graph.py
+--- orig/find_conflict/graph.py	2026-05-12 20:20:24.000000000 +0000
++++ work/find_conflict/graph.py	2026-06-10 03:11:23.707193031 +0000
+@@ -1,34 +1,28 @@
+ # Find_conflict subgraph. Pure wiring.
+ """
+ Topology:
+-    START -> extract_claims -> [Send fan-out] -> find_conflicts_for_claim -> END
++    START -> [Send fan-out, one per section] -> find_conflicts_for_section -> END
+ 
+-extract_claims walks sections sequentially (one LLM call per section).
+-find_conflicts_for_claim runs in parallel: one Send is dispatched per claim,
+-LangGraph schedules them concurrently and reduces their flag outputs into
+-state["flags"] via the `add` reducer.
++One Send is dispatched per section. LangGraph schedules the section branches
++concurrently and reduces their flag outputs into state["flags"] via the `add`
++reducer. Each branch does the whole per-section job: extract that section's
++claims, look up sources per claim, consolidate (dedup) them, run one conflict
++call over all the claims, and return the violations.
+ 
+-See state.py for the reducer wiring. See nodes/claim_extractor.py and
+-nodes/conflict_finder.py for what each node does.
++See state.py for the reducer wiring. See nodes/conflict_finder.py for the
++per-section node and nodes/claim_extractor.py for the extraction helpers it uses.
+ 
+ 
+ PARALLELIZATION NOTES
+ 
+ LangGraph runs Send-spawned branches concurrently when you `.invoke()` the
+ graph. For sync node functions (which ours are), the runtime uses internal
+-threading to actually run them in parallel. No asyncio in user code, no
+-custom semaphores, no extra concurrency knobs.
++threading to run them in parallel. max_concurrency (set on invoke in main.py)
++caps how many run at once.
+ 
+-What is parallel:  the per-claim work (search + build_context + find_conflict).
+-What is sequential: claim extraction (one LLM call per section, in order).
+-
+-Wall-time for a draft with S sections and C claims, with per-call latency T:
+-    sequential everywhere:   (S + C) * T
+-    current (claims parallel): S * T + ~T
+-
+-If extraction also needs to be parallelized later, add a Send fan-out at the
+-START -> extract step with a barrier node before dispatch_to_claims. Same
+-pattern as below, applied to sections.
++What is parallel:  sections (one branch each).
++What is serial:    everything inside a branch (extract, then per-claim search,
++                   then one conflict call).
+ """
+ 
+ from typing import List
+@@ -36,25 +30,22 @@
+ from langgraph.graph import END, START, StateGraph
+ from langgraph.types import Send
+ 
+-from nodes.claim_extractor import extract_claims
+-from nodes.conflict_finder import find_conflicts_for_claim
++from nodes.conflict_finder import find_conflicts_for_section
+ from state import FindConflictState
+ 
+ 
+-# Conditional edge: fan out one Send per claim. LangGraph runs them in parallel.
+-def dispatch_to_claims(state: FindConflictState) -> List[Send]:
++# Conditional edge: fan out one Send per section. LangGraph runs them in parallel.
++def dispatch_to_sections(state: FindConflictState) -> List[Send]:
+     return [
+-        Send("find_conflicts_for_claim", {**state, "current_claim": claim})
+-        for claim in state["claims"]
++        Send("find_conflicts_for_section", {**state, "current_section_id": str(section.id)})
++        for section in state["sections_ordered"]
+     ]
+ 
+ 
+ # Build and compile the find_conflict subgraph.
+ def build_find_conflict_graph():
+     graph = StateGraph(FindConflictState)
+-    graph.add_node("extract_claims", extract_claims)
+-    graph.add_node("find_conflicts_for_claim", find_conflicts_for_claim)
+-    graph.add_edge(START, "extract_claims")
+-    graph.add_conditional_edges("extract_claims", dispatch_to_claims, ["find_conflicts_for_claim"])
+-    graph.add_edge("find_conflicts_for_claim", END)
++    graph.add_node("find_conflicts_for_section", find_conflicts_for_section)
++    graph.add_conditional_edges(START, dispatch_to_sections, ["find_conflicts_for_section"])
++    graph.add_edge("find_conflicts_for_section", END)
+     return graph.compile()
+diff -ru -x __pycache__ -x '*.pyc' orig/find_conflict/llm_client.py work/find_conflict/llm_client.py
+--- orig/find_conflict/llm_client.py	2026-05-12 20:20:24.000000000 +0000
++++ work/find_conflict/llm_client.py	2026-06-10 04:23:44.487945141 +0000
+@@ -25,11 +25,18 @@
+ # Tests register scripted responses keyed by schema class name.
+ FAKE_RESPONSES: Dict[str, List[BaseModel]] = {}
+ 
++# Tests can instead register responses keyed by a substring of the prompt. Used
++# when section branches run in parallel: a FIFO queue would hand a branch the
++# wrong section's response, so we match on prompt content instead. Reads are
++# non-destructive (no pop), so the single per-section retry re-runs cleanly.
++FAKE_RESPONSES_BY_KEY: Dict[str, Dict[str, BaseModel]] = {}
++
+ 
+ # Reset FakeLLM state between tests.
+ def reset_fake_llm() -> None:
+     global FAKE_LLM_DELAY_SECONDS
+     FAKE_RESPONSES.clear()
++    FAKE_RESPONSES_BY_KEY.clear()
+     FAKE_LLM_DELAY_SECONDS = 0.0
+ 
+ 
+@@ -38,13 +45,19 @@
+     FAKE_RESPONSES[schema_name] = list(responses)
+ 
+ 
++# Register prompt-keyed responses for a schema: {substring: response} (FakeLLM only).
++def register_fake_responses_by_key(schema_name: str, mapping: Dict[str, BaseModel]) -> None:
++    FAKE_RESPONSES_BY_KEY[schema_name] = dict(mapping)
++
++
+ # Set per-call latency in seconds (FakeLLM only).
+ def set_fake_delay(seconds: float) -> None:
+     global FAKE_LLM_DELAY_SECONDS
+     FAKE_LLM_DELAY_SECONDS = seconds
+ 
+ 
+-# Fake structured runnable. Sleeps then pops the next scripted response.
++# Fake structured runnable. Matches a keyed response by prompt if registered,
++# else pops the next scripted response off the FIFO queue.
+ class FakeStructuredRunnable:
+     def __init__(self, schema: Type[BaseModel]):
+         self.schema = schema
+@@ -52,6 +65,12 @@
+     def invoke(self, prompt: str) -> BaseModel:
+         if FAKE_LLM_DELAY_SECONDS > 0:
+             time.sleep(FAKE_LLM_DELAY_SECONDS)
++        keyed = FAKE_RESPONSES_BY_KEY.get(self.schema.__name__)
++        if keyed:
++            for key, response in keyed.items():
++                if key in prompt:
++                    return response
++            return self.schema()
+         queue = FAKE_RESPONSES.get(self.schema.__name__, [])
+         if not queue:
+             return self.schema()
+@@ -66,6 +85,7 @@
+ 
+ # Build a real Gemini client. Raises if GOOGLE_API_KEY is missing.
+ def build_gemini_client():
++    from langchain_core.rate_limiters import InMemoryRateLimiter
+     from langchain_google_genai import ChatGoogleGenerativeAI
+ 
+     api_key = os.environ.get("GOOGLE_API_KEY")
+@@ -73,10 +93,14 @@
+         raise RuntimeError(
+             "GOOGLE_API_KEY is not set. Export it in your shell or set USE_FAKE_LLM=1 to use the FakeLLM stub."
+         )
++    # Hardcoded request-rate cap. Complements the graph-level max_concurrency.
++    # Retune or drop if your own wrapper already handles rate limiting.
++    rate_limiter = InMemoryRateLimiter(requests_per_second=5)
+     return ChatGoogleGenerativeAI(
+         model=GEMINI_MODEL,
+         google_api_key=api_key,
+         temperature=0.0,
++        rate_limiter=rate_limiter,
+     )
+ 
+ 
+diff -ru -x __pycache__ -x '*.pyc' orig/find_conflict/main.py work/find_conflict/main.py
+--- orig/find_conflict/main.py	2026-05-12 20:20:21.000000000 +0000
++++ work/find_conflict/main.py	2026-06-10 03:11:12.423001092 +0000
+@@ -1,6 +1,10 @@
+ # Entry point for the find_conflict route.
+ """
+ Pure-function entry point. Section list + selected doc ids in, flags out.
++
++max_concurrency caps how many section branches run at once, so a large draft
++does not fire every section's LLM calls simultaneously. Hardcoded; retune to
++your provider headroom.
+ """
+ 
+ from typing import List
+@@ -12,6 +16,10 @@
+ find_conflict_graph = build_find_conflict_graph()
+ 
+ 
++# Max sections checked concurrently. Caps the Send fan-out burst.
++MAX_CONCURRENCY = 5
++
++
+ # Find_conflict route entry point: draft in, conflict flags out.
+ def find_conflict_flags_for_draft(payload: FindConflictInput) -> List[ReviewerViolation]:
+     sections_ordered = sorted(payload.sections, key=lambda section: section.order)
+@@ -20,9 +28,11 @@
+         "selected_doc_ids": payload.selected_doc_ids,
+         "sections_by_id": {str(section.id): section for section in payload.sections},
+         "sections_ordered": sections_ordered,
+-        "claims": [],
+         "flags": [],
+-        "current_claim": None,
++        "current_section_id": None,
+     }
+-    result = find_conflict_graph.invoke(initial_state)
++    result = find_conflict_graph.invoke(
++        initial_state,
++        config={"max_concurrency": MAX_CONCURRENCY},
++    )
+     return result.get("flags") or []
+diff -ru -x __pycache__ -x '*.pyc' orig/find_conflict/nodes/claim_extractor.py work/find_conflict/nodes/claim_extractor.py
+--- orig/find_conflict/nodes/claim_extractor.py	2026-05-12 20:20:22.000000000 +0000
++++ work/find_conflict/nodes/claim_extractor.py	2026-06-10 03:11:39.793483508 +0000
+@@ -1,10 +1,12 @@
+ # Extract claims from a section and resolve their char offsets.
+ """
+-Contains the extract_claims node plus its domain helpers:
+-  - extract_claims:                 the LangGraph node, walks sections sequentially
+-  - spans_overlap:                  pure helper, dedups claims within a section
++Domain helpers for claim extraction, used by the per-section node:
+   - extract_claims_for_section:     one LLM call per section, capped at 5 claims
+   - resolve_claim:                  build an ExtractedClaim if original_text is found verbatim
++  - spans_overlap:                  pure helper, dedups claims within a section
++
++These run inside the per-section branch (see nodes/conflict_finder.py). There is
++no longer a standalone extract node that walks every section up front.
+ """
+ 
+ from typing import List
+@@ -14,7 +16,6 @@
+ from llm_client import llm_client
+ from models import ExtractedClaim, Section
+ from prompts import CLAIM_EXTRACTOR_PROMPT, CLAIM_EXTRACTOR_RETRY_PROMPT
+-from state import FindConflictState
+ 
+ 
+ # LLM-facing schema. Internal to this module.
+@@ -85,17 +86,3 @@
+     if existing_claim.section_id != new_claim.section_id:
+         return False
+     return existing_claim.start_char < new_claim.end_char and new_claim.start_char < existing_claim.end_char
+-
+-
+-# Node: extract claims from every section, dropping span overlaps within each section.
+-def extract_claims(state: FindConflictState) -> dict:
+-    all_claims: List[ExtractedClaim] = []
+-    for section in state["sections"]:
+-        section_claims = extract_claims_for_section(section)
+-        kept: List[ExtractedClaim] = []
+-        for claim in section_claims:
+-            if any(spans_overlap(accepted, claim) for accepted in kept):
+-                continue
+-            kept.append(claim)
+-        all_claims.extend(kept)
+-    return {"claims": all_claims}
+diff -ru -x __pycache__ -x '*.pyc' orig/find_conflict/nodes/conflict_finder.py work/find_conflict/nodes/conflict_finder.py
+--- orig/find_conflict/nodes/conflict_finder.py	2026-05-12 20:20:22.000000000 +0000
++++ work/find_conflict/nodes/conflict_finder.py	2026-06-10 03:12:05.615195522 +0000
+@@ -1,60 +1,88 @@
+-# Find conflicts between a claim and retrieved source chunks.
++# Per-section conflict finding.
+ """
+-Contains the find_conflicts_for_claim node plus its domain helper:
+-  - find_conflict:                  one LLM call. Given a claim + context + chunks,
++Contains the find_conflicts_for_section node plus its domain helper:
++  - find_conflict:                  one LLM call. Given all of a section's claims +
++                                    the section text + the deduped source pool,
+                                     return zero or more ReviewerViolations.
+-  - find_conflicts_for_claim:       the LangGraph node. Runs in parallel via Send.
+-                                    Wraps retrieve + build_context + find_conflict.
+-
+-No categories enforced on conflicts. The LLM describes the conflict in plain
+-english and quotes the source line that triggered it.
++  - find_conflicts_for_section:     the LangGraph node. One branch per section,
++                                    run in parallel via Send. Extracts the
++                                    section's claims, searches per claim, dedups
++                                    the sources, then runs one conflict call.
++
++The whole section job is wrapped in a single retry: if it raises, wait one
++second and run it once more. If it fails again, return no flags so one bad
++section does not sink the rest of the draft.
++
++Claims and sources are handed to the LLM as numbered lists (1, 2, 3...). The LLM
++cites a finding by claim_index and source_index; we remap each index back to the
++real objects in code (claims[i-1] for the span, chunks[i-1] for the source, which
++still carries its real chunk_id/doc_id). Numbers are easier for the model to emit
++than echoing UUIDs back.
+ """
+ 
+-from typing import List
++import time
++from typing import Dict, List
+ 
+ from pydantic import BaseModel, Field
+ 
+-from helpers.context_builder import build_context
+ from helpers.retriever import search
+ from llm_client import llm_client
+ from models import ExtractedClaim, RetrievedChunk, ReviewerViolation
++from nodes.claim_extractor import extract_claims_for_section, spans_overlap
+ from prompts import FIND_CONFLICT_PROMPT
+ from state import FindConflictState
+ 
+ 
++# Seconds to wait before the single retry. Module-level so tests can zero it.
++RETRY_WAIT_SECONDS = 1.0
++
++
+ # LLM-facing schema. Internal to this module.
+ class ConflictFinding(BaseModel):
++    claim_index: int = Field(description="1-based index of the claim this conflict is about (matches the numbered CLAIMS list)")
++    source_index: int = Field(description="1-based index of the source that triggered the conflict (matches the numbered SOURCES list)")
+     reason: str = Field(description="one or two sentences explaining the conflict in plain english")
+-    source_chunk_id: str = Field(description="id of the chunk that triggered the conflict")
+-    source_excerpt: str = Field(description="verbatim sentence from the chunk that supports the conflict")
++    source_excerpt: str = Field(description="verbatim sentence from the source that supports the conflict")
+ 
+ 
+ class ConflictFindings(BaseModel):
+     conflicts: List[ConflictFinding] = Field(default_factory=list)
+ 
+ 
+-# Find conflicts between one claim and its retrieved sources. Returns 0+ violations.
++# Find conflicts across all of a section's claims against the deduped source pool.
+ def find_conflict(
+-    claim: ExtractedClaim,
++    claims: List[ExtractedClaim],
+     context: str,
+     chunks: List[RetrievedChunk],
+ ) -> List[ReviewerViolation]:
+-    formatted_chunks = "\n---\n".join(
+-        f"[chunk_id: {chunk.chunk_id}]\n[source: {chunk.doc_title}]\n{chunk.text}"
+-        for chunk in chunks
++    # Number both lists from 1 so the model sees 1., 2., 3.
++    formatted_sources = "\n".join(
++        f"{index}. [source: {chunk.doc_title}] {chunk.text}"
++        for index, chunk in enumerate(chunks, start=1)
+     )
++    formatted_claims = "\n".join(
++        f"{index}. {claim.claim_text}"
++        for index, claim in enumerate(claims, start=1)
++    )
++
+     structured = llm_client.with_structured_output(ConflictFindings)
+     response = structured.invoke(FIND_CONFLICT_PROMPT.format(
+-        claim_text=claim.claim_text,
++        formatted_sources=formatted_sources,
++        formatted_claims=formatted_claims,
+         context=context,
+-        formatted_chunks=formatted_chunks,
+     ))
+ 
+-    chunk_to_doc = {chunk.chunk_id: chunk.doc_id for chunk in chunks}
+     violations: List[ReviewerViolation] = []
+     for finding in response.conflicts:
+-        if finding.source_chunk_id not in chunk_to_doc:
++        # Remap both indices to the real objects. Drop anything out of range.
++        if not 1 <= finding.claim_index <= len(claims):
+             continue
++        if not 1 <= finding.source_index <= len(chunks):
++            continue
++        claim = claims[finding.claim_index - 1]
++        source_chunk = chunks[finding.source_index - 1]
++        # source_chunk.chunk_id, source_chunk.doc_id, source_chunk.doc_title all
++        # available here for citation/source build-out.
+         violations.append(ReviewerViolation(
+             source_agent="find_conflict",
+             violation_description=f"{finding.reason} Source: \"{finding.source_excerpt}\"",
+@@ -66,16 +94,46 @@
+     return violations
+ 
+ 
+-# Node: per-claim work. Runs in parallel via Send. Returns flags for one claim.
+-def find_conflicts_for_claim(state: FindConflictState) -> dict:
+-    claim = state["current_claim"]
++# Do the whole section job: extract -> dedup claims -> search per claim ->
++# consolidate sources -> one conflict call. Returns flags for the section.
++def _process_section(section, selected_doc_ids: List[str]) -> List[ReviewerViolation]:
++    # Extract the section's claims and drop span overlaps within the section.
++    claims = extract_claims_for_section(section)
++    deduped_claims: List[ExtractedClaim] = []
++    for claim in claims:
++        if any(spans_overlap(accepted, claim) for accepted in deduped_claims):
++            continue
++        deduped_claims.append(claim)
++    if not deduped_claims:
++        return []
++
++    # Serial DB lookup per claim, then consolidate the source pool by chunk_id
++    # (first-seen order, so source numbering is stable).
++    deduped_chunks: Dict[str, RetrievedChunk] = {}
++    for claim in deduped_claims:
++        for chunk in search(claim.claim_text, selected_doc_ids):
++            deduped_chunks.setdefault(chunk.chunk_id, chunk)
++    chunks = list(deduped_chunks.values())
++    if not chunks:
++        return []
++
++    # One conflict call over all claims, with the whole section as context.
++    return find_conflict(deduped_claims, section.content, chunks)
++
++
++# Node: per-section work. Runs in parallel via Send. Retries once on failure.
++def find_conflicts_for_section(state: FindConflictState) -> dict:
++    section_id = state["current_section_id"]
++    section = state["sections_by_id"][section_id]
++    selected_doc_ids = state["selected_doc_ids"]
++
+     try:
+-        chunks = search(claim.claim_text, state["selected_doc_ids"])
+-        if not chunks:
+-            return {"flags": []}
+-        context = build_context(claim, state["sections_by_id"], state["sections_ordered"])
+-        violations = find_conflict(claim, context, chunks)
+-        return {"flags": violations}
++        return {"flags": _process_section(section, selected_doc_ids)}
+     except Exception as error:
+-        print(f"find_conflicts_for_claim failed for claim in section {claim.section_id}: {error}")
+-        return {"flags": []}
++        print(f"find_conflicts_for_section failed for section {section_id}, retrying in {RETRY_WAIT_SECONDS}s: {error}")
++        time.sleep(RETRY_WAIT_SECONDS)
++        try:
++            return {"flags": _process_section(section, selected_doc_ids)}
++        except Exception as retry_error:
++            print(f"find_conflicts_for_section retry failed for section {section_id}: {retry_error}")
++            return {"flags": []}
+diff -ru -x __pycache__ -x '*.pyc' orig/find_conflict/prompts.py work/find_conflict/prompts.py
+--- orig/find_conflict/prompts.py	2026-05-12 20:20:24.000000000 +0000
++++ work/find_conflict/prompts.py	2026-06-10 03:12:42.610154710 +0000
+@@ -16,7 +16,14 @@
+ 
+ 2. original_text: an EXACT verbatim substring from the section content. This must be character-for-character identical to text in the section, including punctuation, capitalization, and whitespace. Do not paraphrase. Do not add or remove words. Do not change punctuation. If you would need to alter the text in any way to make a clean sentence, pick a different substring that you can quote exactly.
+ 
+-Return at most 5 claims. If the section has fewer checkable claims, return fewer. If the section has no checkable claims, return an empty list.
++What is NOT a claim (do not extract these):
++- Boilerplate, transitions, or framing ("This section covers...", "As noted above...", "The following applies.").
++- Opinions, intentions, goals, or aspirations.
++- Vague or general statements with nothing specific to verify.
++- Background or narrative that asserts no concrete, checkable fact.
++If a sentence is fluff, filler, or contains nothing factual to check against sources, it is not a claim. Skip it.
++
++Returning an empty list is a correct and expected outcome. If the section has no checkable claims, return an empty list. Do not invent or stretch claims to fill space. Return at most 5 claims; if the section has fewer, return fewer.
+ 
+ SECTION TITLE: {section_title}
+ 
+@@ -37,49 +44,53 @@
+ """
+ 
+ 
+-FIND_CONFLICT_PROMPT = """You are checking a claim from a document against retrieved source material from reference documents. Your job is to find conflicts.
++FIND_CONFLICT_PROMPT = """You are checking claims from one section of a document against retrieved source material from reference documents. Your job is to find conflicts.
++
++You are given a numbered list of SOURCES (retrieved reference material) and a numbered list of CLAIMS (statements pulled from the section). Check every claim against the sources and report any conflicts.
+ 
+-A conflict is anything in the retrieved sources that disagrees with the claim, makes it incorrect, makes it outdated, or makes it incompatible with the source. Conflicts can take many forms. Here are examples of what counts:
++A conflict is anything in the sources that disagrees with a claim, makes it incorrect, makes it outdated, or makes it incompatible with the source. Conflicts can take many forms. Here are examples of what counts:
+ 
+-- The claim states a numeric threshold or limit. A source states a different number for the same thing. CONFLICT.
++- A claim states a numeric threshold or limit. A source states a different number for the same thing. CONFLICT.
+ 
+-- The claim cites a version, date, or edition of a referenced document. A source is a newer version that has changed what the claim states. CONFLICT.
++- A claim cites a version, date, or edition of a referenced document. A source is a newer version that has changed what the claim states. CONFLICT.
+ 
+-- The claim describes a rule or procedure one way. A source describes the same rule or procedure differently. CONFLICT.
++- A claim describes a rule or procedure one way. A source describes the same rule or procedure differently. CONFLICT.
+ 
+-- The claim defines a term, role, or category. A source defines it differently. CONFLICT.
++- A claim defines a term, role, or category. A source defines it differently. CONFLICT.
+ 
+-- The claim assigns a responsibility or permission to one party. A source assigns that responsibility or permission to a different party. CONFLICT.
++- A claim assigns a responsibility or permission to one party. A source assigns that responsibility or permission to a different party. CONFLICT.
+ 
+-- The claim states a deadline, timeframe, or duration. A source states a different one for the same action. CONFLICT.
++- A claim states a deadline, timeframe, or duration. A source states a different one for the same action. CONFLICT.
+ 
+-- The claim uses a term or acronym one way. A source uses it differently for the same context. CONFLICT.
++- A claim uses a term or acronym one way. A source uses it differently for the same context. CONFLICT.
+ 
+ These are examples, not a closed list. Use judgment for other disagreements.
+ 
+ What is NOT a conflict:
+-- The source is on a related topic but does not directly address what the claim states. NOT a conflict.
+-- The source uses different phrasing for the same idea. NOT a conflict.
+-- The source provides additional detail the claim happens not to mention. NOT a conflict (unless it actively disagrees).
+-- You suspect the claim is wrong based on your own knowledge but no retrieved source supports your suspicion. NOT a conflict.
++- A source is on a related topic but does not directly address what a claim states. NOT a conflict.
++- A source uses different phrasing for the same idea. NOT a conflict.
++- A source provides additional detail a claim happens not to mention. NOT a conflict (unless it actively disagrees).
++- You suspect a claim is wrong based on your own knowledge but no retrieved source supports your suspicion. NOT a conflict.
+ 
+ CRITICAL RULES
+ 
+-- The retrieved sources are your only valid evidence. Do not flag conflicts based on your own knowledge.
+-- The CONTEXT below is provided to help you understand what the claim means. Do NOT flag conflicts you notice in the context. Context is reference material only.
+-- source_excerpt must be a verbatim sentence or short phrase from the chunk, copied exactly.
+-- Only report a conflict when the retrieved sources directly and clearly disagree with the claim. Do not dig for conflicts. Do not stretch interpretations. Do not report something you would have to argue for. If nothing in the sources clearly disagrees with the claim, return an empty list. An empty list is the correct and frequent answer.
+-- A single claim may have zero, one, or several conflicts. Report each one separately.
+-- If two retrieved chunks point to the same underlying conflict, pick the stronger one and report it once.
++- The SOURCES are your only valid evidence. Do not flag conflicts based on your own knowledge.
++- The CONTEXT below is the full section the claims came from, provided only so you understand what each claim means. Do NOT flag conflicts you notice inside the CONTEXT. It is reference material only.
++- For each conflict, claim_index is the number of the claim in the CLAIMS list and source_index is the number of the source in the SOURCES list. Do not invent indices.
++- source_excerpt must be a verbatim sentence or short phrase from the source, copied exactly.
++- Only report a conflict when a source directly and clearly disagrees with a claim. Do not dig for conflicts. Do not stretch interpretations. Do not report anything you would have to argue for.
++- Returning an empty list is correct and expected. If nothing in the sources clearly disagrees with any claim, return an empty list. Most checks find no conflicts; that is a normal, correct result, not a failure.
++- A single claim may have zero, one, or several conflicts. Report each one separately. A claim with no conflict simply does not appear in your output.
++- If two sources point to the same underlying conflict for the same claim, pick the stronger one and report it once.
+ 
+-CLAIM
+-{claim_text}
++SOURCES (the only valid source of conflicts)
++{formatted_sources}
+ 
+-CONTEXT (the section the claim came from, for understanding only)
+-{context}
++CLAIMS (statements from the section to check)
++{formatted_claims}
+ 
+-RETRIEVED SOURCES (the only valid source of conflicts)
+-{formatted_chunks}
++CONTEXT (the full section the claims came from, for understanding only)
++{context}
+ 
+-Find any conflicts between the CLAIM and the RETRIEVED SOURCES. Return an empty list if there are no clear conflicts.
++Find any conflicts between the CLAIMS and the SOURCES. Return an empty list if there are no clear conflicts.
+ """
+diff -ru -x __pycache__ -x '*.pyc' orig/find_conflict/run_sample.py work/find_conflict/run_sample.py
+--- orig/find_conflict/run_sample.py	2026-05-12 20:20:24.000000000 +0000
++++ work/find_conflict/run_sample.py	2026-06-10 04:24:20.814028930 +0000
+@@ -6,14 +6,13 @@
+ flag in a readable form.
+ """
+ 
+-from llm_client import register_fake_responses, reset_fake_llm
++from llm_client import reset_fake_llm
+ from main import find_conflict_flags_for_draft
+ from models import FindConflictInput
+ from sample_data import (
+-    SAMPLE_CONFLICT_RESPONSES,
+-    SAMPLE_EXTRACTOR_RESPONSES,
+     SAMPLE_SECTIONS,
+     SAMPLE_SELECTED_DOC_IDS,
++    register_sample_fakes,
+ )
+ 
+ 
+@@ -28,8 +27,7 @@
+ # Run the pipeline and pretty-print the flags.
+ def main():
+     reset_fake_llm()
+-    register_fake_responses("ExtractedClaimsLLM", SAMPLE_EXTRACTOR_RESPONSES)
+-    register_fake_responses("ConflictFindings", SAMPLE_CONFLICT_RESPONSES)
++    register_sample_fakes()
+ 
+     payload = FindConflictInput(
+         sections=SAMPLE_SECTIONS,
+diff -ru -x __pycache__ -x '*.pyc' orig/find_conflict/sample_data.py work/find_conflict/sample_data.py
+--- orig/find_conflict/sample_data.py	2026-05-12 20:20:24.000000000 +0000
++++ work/find_conflict/sample_data.py	2026-06-10 04:24:11.741530710 +0000
+@@ -1,13 +1,19 @@
+ # Sample draft data for trying the find_conflict route end to end.
+ """
+ SAMPLE_SECTIONS is a List[Section] you can drop into FindConflictInput.
+-SAMPLE_EXTRACTOR_RESPONSES and SAMPLE_CONFLICT_RESPONSES are the FakeLLM
+-responses that match this sample, so the pipeline runs and produces flags.
++
++Because sections now run in parallel, the FakeLLM responses are registered keyed
++by a substring of each section (via register_fake_responses_by_key) rather than
++as an ordered queue. register_sample_fakes() wires them up; run_sample.py calls it.
++
++The conflict findings' source_index values assume the deduped source order each
++section produces (search each claim in order, dedup by chunk_id, first seen wins).
+ """
+ 
+ import uuid
+-from typing import List
++from typing import Dict, List
+ 
++from llm_client import register_fake_responses_by_key
+ from models import Section
+ from nodes.claim_extractor import ExtractedClaimLLM, ExtractedClaimsLLM
+ from nodes.conflict_finder import ConflictFinding, ConflictFindings
+@@ -74,10 +80,18 @@
+ ]
+ 
+ 
+-# Fake extractor responses, one per section (matches SAMPLE_SECTIONS order).
+-SAMPLE_EXTRACTOR_RESPONSES: List[ExtractedClaimsLLM] = [
+-    ExtractedClaimsLLM(claims=[]),
+-    ExtractedClaimsLLM(claims=[
++# Each key is a substring unique to one section (appears in both that section's
++# extractor prompt and its conflict prompt, since the section text is the context).
++INTRO_KEY = "standard operating procedures"
++TRAVEL_KEY = "travel expense reports within 30 days"
++AWARD_KEY = "Contracts under $25000"
++REVIEW_KEY = "reviewed annually"
++
++
++# Fake extractor responses, keyed by section.
++SAMPLE_EXTRACTOR_BY_KEY: Dict[str, ExtractedClaimsLLM] = {
++    INTRO_KEY: ExtractedClaimsLLM(claims=[]),
++    TRAVEL_KEY: ExtractedClaimsLLM(claims=[
+         ExtractedClaimLLM(
+             claim_text="Travel expense reports must be submitted within 30 days of trip completion.",
+             original_text="Employees must submit travel expense reports within 30 days of trip completion.",
+@@ -91,49 +105,59 @@
+             original_text="International travel always requires director-level approval regardless of cost.",
+         ),
+     ]),
+-    ExtractedClaimsLLM(claims=[
++    AWARD_KEY: ExtractedClaimsLLM(claims=[
+         ExtractedClaimLLM(
+             claim_text="Contracts under $25000 may be awarded without competitive bidding at the contracting officer's discretion.",
+             original_text="Contracts under $25000 may be awarded without competitive bidding at the contracting officer's discretion.",
+         ),
+     ]),
+-    ExtractedClaimsLLM(claims=[
++    REVIEW_KEY: ExtractedClaimsLLM(claims=[
+         ExtractedClaimLLM(
+             claim_text="SOP documents shall be reviewed annually.",
+             original_text="All SOP documents shall be reviewed annually to ensure continued relevance.",
+         ),
+     ]),
+-]
++}
+ 
+ 
+-# Fake conflict responses, queued in the order claims will be processed.
+-SAMPLE_CONFLICT_RESPONSES: List[ConflictFindings] = [
+-    ConflictFindings(conflicts=[
++# Fake conflict responses, keyed by section. One ConflictFindings per section.
++# Travel: claim 1 (30 days) vs source 1 (45 days); claim 2 (approval) vs source 2 (no approval).
++# Award:  claim 1 vs source 1 (competition above 10000). Review: claim 1 vs source 1 (biennial).
++SAMPLE_CONFLICT_BY_KEY: Dict[str, ConflictFindings] = {
++    TRAVEL_KEY: ConflictFindings(conflicts=[
+         ConflictFinding(
++            claim_index=1,
++            source_index=1,
+             reason="The claim states a 30 day deadline. The source states 45 days for the same submission.",
+-            source_chunk_id="chunk_sop_travel",
+             source_excerpt="All travel expense forms must be submitted within 45 days of the trip end date.",
+         ),
+-    ]),
+-    ConflictFindings(conflicts=[
+         ConflictFinding(
++            claim_index=2,
++            source_index=2,
+             reason="The claim requires prior supervisor approval. The source says travel under 500 dollars does not require prior approval.",
+-            source_chunk_id="chunk_sop_travel_b",
+             source_excerpt="Travel under $500 does not require prior supervisor approval.",
+         ),
+     ]),
+-    ConflictFindings(conflicts=[
++    AWARD_KEY: ConflictFindings(conflicts=[
+         ConflictFinding(
++            claim_index=1,
++            source_index=1,
+             reason="The claim allows officer discretion for awards under 25000 dollars. The source requires competition above 10000 dollars regardless of discretion.",
+-            source_chunk_id="chunk_far_13_104",
+             source_excerpt="Contracts above $10,000 shall be awarded on the basis of competition to the maximum extent practicable.",
+         ),
+     ]),
+-    ConflictFindings(conflicts=[
++    REVIEW_KEY: ConflictFindings(conflicts=[
+         ConflictFinding(
++            claim_index=1,
++            source_index=1,
+             reason="The claim states annual review. The source mandates biennial review.",
+-            source_chunk_id="chunk_policy_review",
+             source_excerpt="All policy documents shall be reviewed and updated on a biennial basis, not annually.",
+         ),
+     ]),
+-]
++}
++
++
++# Register the sample fakes (keyed by section) on the FakeLLM.
++def register_sample_fakes() -> None:
++    register_fake_responses_by_key("ExtractedClaimsLLM", SAMPLE_EXTRACTOR_BY_KEY)
++    register_fake_responses_by_key("ConflictFindings", SAMPLE_CONFLICT_BY_KEY)
+diff -ru -x __pycache__ -x '*.pyc' orig/find_conflict/state.py work/find_conflict/state.py
+--- orig/find_conflict/state.py	2026-05-12 20:20:24.000000000 +0000
++++ work/find_conflict/state.py	2026-06-10 03:11:01.388529328 +0000
+@@ -3,14 +3,15 @@
+ flags has an `add` reducer because parallel Send branches each return their
+ own flag list, and we want them concatenated rather than overwritten.
+ 
+-current_claim carries the per-claim payload when Send fans out. Only the
+-per-claim node reads it.
++current_section_id carries the per-section payload when Send fans out. Only the
++per-section node reads it. Each section branch extracts its own claims, so there
++is no longer a shared `claims` list in state.
+ """
+ 
+ import operator
+ from typing import Annotated, Dict, List, Optional, TypedDict
+ 
+-from models import ExtractedClaim, ReviewerViolation, Section
++from models import ReviewerViolation, Section
+ 
+ 
+ class FindConflictState(TypedDict):
+@@ -18,6 +19,5 @@
+     selected_doc_ids: List[str]
+     sections_by_id: Dict[str, Section]
+     sections_ordered: List[Section]
+-    claims: List[ExtractedClaim]
+     flags: Annotated[List[ReviewerViolation], operator.add]
+-    current_claim: Optional[ExtractedClaim]
++    current_section_id: Optional[str]
+diff -ru -x __pycache__ -x '*.pyc' orig/find_conflict/tests/test_find_conflict.py work/find_conflict/tests/test_find_conflict.py
+--- orig/find_conflict/tests/test_find_conflict.py	2026-05-12 20:20:24.000000000 +0000
++++ work/find_conflict/tests/test_find_conflict.py	2026-06-10 04:25:26.093531422 +0000
+@@ -1,9 +1,12 @@
+ # Tests for the find_conflict route.
+ """
+-Three scenarios:
+-  1. Section with a claim that conflicts with a retrieved chunk. One flag emitted.
+-  2. Section with a claim but no matching chunks. Zero flags.
++Covers:
++  1. A claim that conflicts with a retrieved chunk. One flag emitted.
++  2. A claim with no matching chunks. Zero flags.
+   3. Two claims with overlapping spans. Only the first survives.
++  4. One section, several claims -> a single batched conflict call (not one per claim).
++  5. Several sections -> flags aggregate across the parallel branches.
++  6. A section that fails once -> retried after the wait and recovers.
+ 
+ Forces FakeLLM regardless of shell env so tests stay deterministic.
+ """
+@@ -15,7 +18,14 @@
+ 
+ sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
+ 
+-from llm_client import FakeLLM, llm_client, register_fake_responses, reset_fake_llm
++import nodes.conflict_finder as conflict_finder
++from llm_client import (
++    FakeLLM,
++    llm_client,
++    register_fake_responses,
++    register_fake_responses_by_key,
++    reset_fake_llm,
++)
+ from main import find_conflict_flags_for_draft
+ from models import FindConflictInput, Section
+ from nodes.claim_extractor import ExtractedClaimLLM, ExtractedClaimsLLM
+@@ -54,18 +64,15 @@
+     register_fake_responses("ConflictFindings", [
+         ConflictFindings(conflicts=[
+             ConflictFinding(
++                claim_index=1,
++                source_index=1,
+                 reason="The claim states a 30 day deadline. The source states 45 days for the same submission.",
+-                source_chunk_id="chunk_sop_travel",
+                 source_excerpt="All travel expense forms must be submitted within 45 days of the trip end date.",
+             ),
+         ]),
+     ])
+ 
+-    payload = FindConflictInput(
+-        sections=[section],
+-        selected_doc_ids=["doc_sop_travel"],
+-    )
+-
++    payload = FindConflictInput(sections=[section], selected_doc_ids=["doc_sop_travel"])
+     flags = find_conflict_flags_for_draft(payload)
+ 
+     assert len(flags) == 1, f"expected 1 flag, got {len(flags)}"
+@@ -97,11 +104,7 @@
+         ]),
+     ])
+ 
+-    payload = FindConflictInput(
+-        sections=[section],
+-        selected_doc_ids=["doc_sop_travel", "doc_far"],
+-    )
+-
++    payload = FindConflictInput(sections=[section], selected_doc_ids=["doc_sop_travel", "doc_far"])
+     flags = find_conflict_flags_for_draft(payload)
+ 
+     assert len(flags) == 0, f"expected 0 flags, got {len(flags)}"
+@@ -137,28 +140,175 @@
+     register_fake_responses("ConflictFindings", [
+         ConflictFindings(conflicts=[
+             ConflictFinding(
++                claim_index=1,
++                source_index=1,
+                 reason="The claim requires prior supervisor approval. The source says travel under 500 dollars does not require prior approval.",
+-                source_chunk_id="chunk_sop_travel_b",
+                 source_excerpt="Travel under $500 does not require prior supervisor approval.",
+             ),
+         ]),
+     ])
+ 
+-    payload = FindConflictInput(
+-        sections=[section],
+-        selected_doc_ids=["doc_sop_travel"],
+-    )
+-
++    payload = FindConflictInput(sections=[section], selected_doc_ids=["doc_sop_travel"])
+     flags = find_conflict_flags_for_draft(payload)
+ 
+     assert len(flags) == 1, f"expected 1 flag (overlap should be dropped), got {len(flags)}"
+-    flag = flags[0]
+-    assert flag.offending_text == "Travel under $500 requires supervisor approval before booking."
++    assert flags[0].offending_text == "Travel under $500 requires supervisor approval before booking."
+     print("PASS test_overlapping_claims_dedup_at_extraction")
+ 
+ 
++# Test 4: several claims in one section resolve to a SINGLE batched conflict call.
++# Only one ConflictFindings is queued; if the code called per-claim, the second
++# call would drain the empty queue and we'd lose a flag. Two flags proves one call.
++def test_one_batched_conflict_call_per_section():
++    reset_fake_llm()
++
++    section = Section(
++        order=0,
++        title="Travel",
++        content=(
++            "Employees must submit travel expense reports within 30 days of trip completion. "
++            "Travel under $500 requires supervisor approval before booking."
++        ),
++    )
++
++    register_fake_responses("ExtractedClaimsLLM", [
++        ExtractedClaimsLLM(claims=[
++            ExtractedClaimLLM(
++                claim_text="Travel expense reports must be submitted within 30 days of trip completion.",
++                original_text="Employees must submit travel expense reports within 30 days of trip completion.",
++            ),
++            ExtractedClaimLLM(
++                claim_text="Travel under 500 dollars requires supervisor approval before booking.",
++                original_text="Travel under $500 requires supervisor approval before booking.",
++            ),
++        ]),
++    ])
++
++    register_fake_responses("ConflictFindings", [
++        ConflictFindings(conflicts=[
++            ConflictFinding(
++                claim_index=1, source_index=1,
++                reason="30 day deadline vs 45 days.",
++                source_excerpt="All travel expense forms must be submitted within 45 days of the trip end date.",
++            ),
++            ConflictFinding(
++                claim_index=2, source_index=2,
++                reason="Prior approval required vs not required under 500 dollars.",
++                source_excerpt="Travel under $500 does not require prior supervisor approval.",
++            ),
++        ]),
++    ])
++
++    payload = FindConflictInput(sections=[section], selected_doc_ids=["doc_sop_travel"])
++    flags = find_conflict_flags_for_draft(payload)
++
++    assert len(flags) == 2, f"expected 2 flags from one batched call, got {len(flags)}"
++    offending = {f.offending_text for f in flags}
++    assert "Employees must submit travel expense reports within 30 days of trip completion." in offending
++    assert "Travel under $500 requires supervisor approval before booking." in offending
++    print("PASS test_one_batched_conflict_call_per_section")
++
++
++# Test 5: several sections aggregate flags across the parallel branches.
++def test_parallel_sections_aggregate_flags():
++    reset_fake_llm()
++
++    travel = Section(
++        order=0, title="Travel",
++        content="Employees must submit travel expense reports within 30 days of trip completion.",
++    )
++    review = Section(
++        order=1, title="Review",
++        content="All SOP documents shall be reviewed annually.",
++    )
++
++    register_fake_responses_by_key("ExtractedClaimsLLM", {
++        "30 days of trip completion": ExtractedClaimsLLM(claims=[
++            ExtractedClaimLLM(
++                claim_text="Travel expense reports must be submitted within 30 days of trip completion.",
++                original_text="Employees must submit travel expense reports within 30 days of trip completion.",
++            ),
++        ]),
++        "reviewed annually": ExtractedClaimsLLM(claims=[
++            ExtractedClaimLLM(
++                claim_text="SOP documents shall be reviewed annually.",
++                original_text="All SOP documents shall be reviewed annually.",
++            ),
++        ]),
++    })
++    register_fake_responses_by_key("ConflictFindings", {
++        "30 days of trip completion": ConflictFindings(conflicts=[
++            ConflictFinding(claim_index=1, source_index=1, reason="30 vs 45 days.",
++                            source_excerpt="All travel expense forms must be submitted within 45 days of the trip end date."),
++        ]),
++        "reviewed annually": ConflictFindings(conflicts=[
++            ConflictFinding(claim_index=1, source_index=1, reason="annual vs biennial.",
++                            source_excerpt="All policy documents shall be reviewed and updated on a biennial basis, not annually."),
++        ]),
++    })
++
++    payload = FindConflictInput(sections=[travel, review], selected_doc_ids=["doc_sop_travel", "doc_policy_meta"])
++    flags = find_conflict_flags_for_draft(payload)
++
++    assert len(flags) == 2, f"expected 2 flags (one per section), got {len(flags)}"
++    by_section = {f.section_id for f in flags}
++    assert by_section == {str(travel.id), str(review.id)}
++    print("PASS test_parallel_sections_aggregate_flags")
++
++
++# Test 6: a section that raises once is retried after the wait and recovers.
++def test_section_retry_recovers():
++    reset_fake_llm()
++
++    section = Section(
++        order=0, title="Travel",
++        content="Employees must submit travel expense reports within 30 days of trip completion.",
++    )
++
++    register_fake_responses_by_key("ExtractedClaimsLLM", {
++        "30 days of trip completion": ExtractedClaimsLLM(claims=[
++            ExtractedClaimLLM(
++                claim_text="Travel expense reports must be submitted within 30 days of trip completion.",
++                original_text="Employees must submit travel expense reports within 30 days of trip completion.",
++            ),
++        ]),
++    })
++    register_fake_responses_by_key("ConflictFindings", {
++        "30 days of trip completion": ConflictFindings(conflicts=[
++            ConflictFinding(claim_index=1, source_index=1, reason="30 vs 45 days.",
++                            source_excerpt="All travel expense forms must be submitted within 45 days of the trip end date."),
++        ]),
++    })
++
++    real_search = conflict_finder.search
++    real_wait = conflict_finder.RETRY_WAIT_SECONDS
++    state = {"calls": 0}
++
++    def flaky_search(*args, **kwargs):
++        state["calls"] += 1
++        if state["calls"] == 1:
++            raise RuntimeError("transient lookup failure")
++        return real_search(*args, **kwargs)
++
++    conflict_finder.search = flaky_search
++    conflict_finder.RETRY_WAIT_SECONDS = 0  # don't actually wait in the test
++    try:
++        payload = FindConflictInput(sections=[section], selected_doc_ids=["doc_sop_travel"])
++        flags = find_conflict_flags_for_draft(payload)
++    finally:
++        conflict_finder.search = real_search
++        conflict_finder.RETRY_WAIT_SECONDS = real_wait
++
++    assert state["calls"] >= 2, "expected a retry after the first failure"
++    assert len(flags) == 1, f"expected 1 flag after retry recovery, got {len(flags)}"
++    print("PASS test_section_retry_recovers")
++
++
+ if __name__ == "__main__":
+     test_conflict_produces_violation()
+     test_no_chunks_returns_no_flags()
+     test_overlapping_claims_dedup_at_extraction()
++    test_one_batched_conflict_call_per_section()
++    test_parallel_sections_aggregate_flags()
++    test_section_retry_recovers()
+     print("\nAll tests passed.")
