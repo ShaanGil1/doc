@@ -1,0 +1,30 @@
+def set_document_defaults(document, line_spacing: Optional[float] = None,
+                          space_after_pt: Optional[float] = None):
+    """Set <w:docDefaults>, the layer underneath every style.
+
+    python-docx's bundled template puts w:line="276" here, which is 1.15 line
+    spacing, and it applies to the whole document no matter what the styles
+    say. A style only overrides it where the style sets w:line itself, so the
+    fix belongs here rather than on each style"""
+    defaults = document.styles.element.find(qn("w:docDefaults"))
+    if defaults is None:
+        return
+    paragraph_defaults = defaults.find(qn("w:pPrDefault"))
+    if paragraph_defaults is None:
+        paragraph_defaults = OxmlElement("w:pPrDefault")
+        defaults.append(paragraph_defaults)
+    properties = paragraph_defaults.find(qn("w:pPr"))
+    if properties is None:
+        properties = OxmlElement("w:pPr")
+        paragraph_defaults.append(properties)
+
+    spacing = properties.find(qn("w:spacing"))
+    if spacing is None:
+        spacing = OxmlElement("w:spacing")
+        insert_in_schema_order(properties, spacing)
+    if line_spacing is not None:
+        spacing.set(qn("w:line"), str(int(round(line_spacing * 240))))
+        spacing.set(qn("w:lineRule"), "auto")
+    if space_after_pt is not None:
+        spacing.set(qn("w:after"), str(int(round(space_after_pt * 20))))
+    return spacing
