@@ -1,0 +1,44 @@
+HEADING_LINE = re.compile(r"^(#{1,6})\s+(.*)$")
+
+
+def split_input(markdown_text: str) -> Tuple[str, str]:
+    """Split one combined markdown string into (enclosures, sections).
+
+    Any heading that matches a required section, plus everything under it,
+    moves to the sections string. Everything else stays where it is. Content
+    belongs to a section until the next heading at the same or a shallower
+    level, which is the same extent rule split_sections uses.
+
+    For when the two inputs are not authored separately yet.
+    """
+    sections, enclosures = [], []
+    target, depth = enclosures, 99
+
+    for line in (markdown_text or "").splitlines():
+        match = HEADING_LINE.match(line)
+        if match and len(match.group(1)) <= depth:
+            name = SECTION_ALIASES.get(normalize(match.group(2)))
+            target = sections if name else enclosures
+            depth = len(match.group(1)) if name else 99
+        target.append(line)
+
+    return ("\n".join(enclosures).strip() + "\n",
+            "\n".join(sections).strip() + "\n")
+
+
+
+
+      #########
+          markdown = [a for a in args if a.lower().endswith(".md")]
+    other = [a for a in args if not a.lower().endswith(".md")]
+
+    if len(markdown) >= 2:
+        enclosures = Path(markdown[0]).read_text(encoding="utf-8")
+        sections = Path(markdown[1]).read_text(encoding="utf-8")
+    elif markdown:
+        combined = Path(markdown[0]).read_text(encoding="utf-8")
+        enclosures, sections = dlai.split_input(combined)
+        print("split %s: %d chars of sections, %d of enclosures"
+              % (markdown[0], len(sections), len(enclosures)))
+    else:
+        enclosures = sections = ""
