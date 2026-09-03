@@ -1,0 +1,568 @@
+--- a/config.py
++++ b/config.py
+@@ -96,7 +96,8 @@
+ 
+     # ---- enclosure pages ---------------------------------------------------
+     "enclosure":   Style("DLAI Enclosure Heading", base="Heading 2", caps=True,
+-                         align=CENTER, after=24.0, page_break=True),
++                         underline=True, align=CENTER, after=24.0,
++                         page_break=True),
+     "encl_h2":     Style("DLAI Enclosure Sub", base="Heading 3", before=GAP,
+                          underline=True, numbered=True, indent=True,
+                          suffix=":"),
+@@ -107,6 +108,14 @@
+     # ---- glossary ----------------------------------------------------------
+     "glossary_part": Style("DLAI Glossary Part", base="Heading 3", caps=True,
+                            align=CENTER, before=GAP, after=24.0),
++
++    # ---- appendices ---------------------------------------------------------
++    # its own page, reading "APPENDICES:" with the body below it
++    "appendices":  Style("DLAI Appendices", base="Heading 2", caps=True,
++                         underline=True, after=GAP, page_break=True,
++                         suffix=":"),
++    # authored back matter prose: flush left, unnumbered, no suffix
++    "flat":        Style("DLAI Flat", before=GAP),
+ }
+ 
+ 
+@@ -117,8 +126,11 @@
+ }
+ 
+ # Markers repeat to fill Word's 9 levels: 1. -> a. -> (1) -> (a) -> 1. ...
++# The second time round, the marker itself is underlined, so level five reads
++# as an underlined 1. and level six as an underlined a.
+ CASCADE = (("decimal", "{}."), ("lowerLetter", "{}."),
+            ("decimal", "({})"), ("lowerLetter", "({})"))
++CASCADE_REPEAT_UNDERLINE = True
+ INDENT_STEP_IN = 0.25
+ NUMBER_SUFFIX = "tab"
+ 
+@@ -135,9 +147,10 @@
+     "INFORMATION REQUIREMENTS": ("INFORMATION REQUIRMENTS",),
+     "RELEASABILITY": ("RELEASEABILITY",),
+     "INTERNAL CONTROLS": ("INTERNAL CONTROL",),
++    "EXPIRATION DATE": ("EXPIRATION", "EXPIRATION DATES"),
+     "SIGNATURE BLOCK": ("SIGNATURE",),
+ }
+-MISSING_PLACEHOLDER = "this is missing"
++MISSING_PLACEHOLDER = "section not found"
+ 
+ # Matched like any other section so it is never mistaken for an enclosure, but
+ # its content feeds the signature block rather than printing as a numbered
+@@ -184,7 +197,8 @@
+     # Which of our styles become which table of contents level. Word builds
+     # the rows from this, so the styles listed here are the ones that appear
+     "toc_levels": (("enclosure", 1), ("encl_h2", 2), ("encl_h3", 3),
+-                   ("glossary_part", 2)),
++                   ("glossary_part", 2), ("appendices", 1)),
++    "appendices_title": "Appendices",
+     "toc_placeholder": "Right-click here and choose Update Field",
+     # (title, entries). Entries use the same flush-left, term-underlined
+     # shape as the DEFINITIONS section
+@@ -202,8 +216,16 @@
+             "for the content of this issuance and for its periodic review.",
+         )),
+     ),
+-    "trailing_lists": (
+-        ("TABLES", ("This DLAI contains no tables.",)),
+-        ("FIGURES", ("This DLAI contains no figures.",)),
+-    ),
+ }
++
++# Back matter titles, name -> extra spellings. Only the pages the author wrote
++# are written, apart from GLOSSARY which falls back to BACK["glossary_parts"].
++# Written in this order after the enclosures
++BACK_MATTER = {
++    "APPENDICES": ("APPENDIX",),
++    "GLOSSARY": (),
++    "TABLES": ("TABLE", "TABLE(S)"),
++    "FIGURES": ("FIGURE", "FIGURE(S)"),
++}
++# An authored table of contents is dropped; the pipeline generates its own
++TOC_TITLES = ("TABLE OF CONTENTS", "CONTENTS")
+--- a/helpers.py
++++ b/helpers.py
+@@ -484,12 +484,15 @@
+         )
+ 
+     def create_list(self, is_ordered: bool, start_number: int = 1,
+-                    cascade=None, suffix: Optional[str] = None) -> int:
++                    cascade=None, suffix: Optional[str] = None,
++                    underline_repeat: bool = False) -> int:
+         """Return a numId for a brand new list.
+ 
+         cascade replaces the 1./a./i. marker sequence for this list only.
+         suffix is what separates marker from text: 'tab', 'space' or 'nothing'.
+-        Leaving it None omits the element, which is Word's own default of tab"""
++        Leaving it None omits the element, which is Word's own default of tab.
++        underline_repeat underlines the marker once the cascade has wrapped,
++        so the second "1." (level five) is not mistaken for level one"""
+         if not is_ordered:
+             if self.shared_bullet_num_id is None:
+                 self.shared_bullet_num_id = self.numbering_root.add_num(
+@@ -497,7 +500,7 @@
+             return self.shared_bullet_num_id
+         return self.numbering_root.add_num(
+             self.create_abstract_definition(
+-                True, start_number, cascade, suffix)).numId
++                True, start_number, cascade, suffix, underline_repeat)).numId
+ 
+     @staticmethod
+     def apply_to_paragraph(paragraph, num_id: int, nesting_level: int):
+@@ -507,8 +510,8 @@
+             % (nsdecls("w"), nesting_level, num_id)))
+ 
+     def create_abstract_definition(self, is_ordered: bool, start_number: int = 1,
+-                                   cascade=None,
+-                                   suffix: Optional[str] = None) -> int:
++                                   cascade=None, suffix: Optional[str] = None,
++                                   underline_repeat: bool = False) -> int:
+         """Build one <w:abstractNum> covering all 9 levels. Returns its id."""
+         definition_id = self.next_abstract_id
+         self.next_abstract_id += 1
+@@ -521,7 +524,7 @@
+             # Only the outermost level
+             definition.append(self.build_level_definition(
+                 level, is_ordered, start_number if level == 0 else 1,
+-                cascade, suffix))
++                cascade, suffix, underline_repeat))
+ 
+         existing_definitions = self.numbering_root.findall(qn("w:abstractNum"))
+         if existing_definitions:
+@@ -532,13 +535,17 @@
+ 
+     @staticmethod
+     def build_level_definition(level: int, is_ordered: bool, start_number: int,
+-                               cascade=None, suffix: Optional[str] = None):
++                               cascade=None, suffix: Optional[str] = None,
++                               underline_repeat: bool = False):
+         """One <w:lvl>: everything about how depth `level` looks"""
+         if is_ordered:
+             markers = cascade or DEFAULT_ORDERED_CASCADE
+             number_format, marker_shape = markers[level % len(markers)]
+             marker_text = marker_shape.format("%%%d" % (level + 1))
+-            marker_font_xml = ""
++            # second time round the cascade the marker is underlined
++            marker_font_xml = ('<w:rPr><w:u w:val="single"/></w:rPr>'
++                               if underline_repeat and level >= len(markers)
++                               else "")
+         else:
+             marker_font = BULLET_MARKERS[level % 3][1]
+             number_format, marker_text = "bullet", BULLET_MARKERS[level % 3][0]
+--- a/dlai.py
++++ b/dlai.py
+@@ -103,7 +103,8 @@
+ def new_cascade_list(numbering, cascade=None) -> int:
+     """A fresh numId each call, which is what makes numbering restart"""
+     return numbering.create_list(True, cascade=cascade or cfg.CASCADE,
+-                                 suffix=cfg.NUMBER_SUFFIX)
++                                 suffix=cfg.NUMBER_SUFFIX,
++                                 underline_repeat=cfg.CASCADE_REPEAT_UNDERLINE)
+ 
+ 
+ # =========================================================================== #
+@@ -151,7 +152,8 @@
+     The bounds stop a long sentence that merely contains a colon, such as
+     'The requirements are as follows: a valid document', from qualifying"""
+     position = text.find(":") if text else -1
+-    if position < 0:
++    # "[INPUT REQUIRED: fill this in]" is a placeholder, not a titled line
++    if position < 0 or text.lstrip().startswith("["):
+         return "", text
+     head, rest = text[:position], text[position + 1:].strip()
+     if (not head.strip() or not rest
+@@ -173,17 +175,27 @@
+ BOLD_FIELD_LINE = re.compile(r"^\s*\*\*\s*(.+?)\s*:?\s*\*\*\s*:?\s*(.*)$")
+ 
+ # label -> the key write_cover looks for
+-COVER_FIELDS = {"OPR": "opr", "SUBJECT": "subject",
++COVER_FIELDS = {"OPR": "opr",
++                "OFFICE OF PRIMARY RESPONSIBILITY": "opr",
++                "OFFICE OF PRIMARY RESPONSIBILITY (OPR)": "opr",
++                "SUBJECT": "subject",
+                 "EFFECTIVE DATE": "effective", "EFFECTIVE": "effective",
+                 "REFERENCES": "references"}
+ 
++# Cover values and signature lines are taken from the raw text and printed
++# as plain runs, so markdown escapes like \[ would otherwise show their slash
++ESCAPED = re.compile(r"\\([\\`*_{}\[\]()#+\-.!|>~])")
++def unescape(text: str) -> str:
++    return ESCAPED.sub(r"\1", text)
++
+ 
+ def split_cover(markdown_text: str) -> Tuple[str, Dict[str, str]]:
+     """Pull "**OPR:** value" style lines off the top. Returns (rest, fields).
+ 
+-    Scanning stops at the first heading or bold-only line, so only the block
+-    above the body is considered. A value runs until the next line carrying
+-    ** or #, which lets it wrap across lines.
++    Scanning stops at the first heading, so only the block above the body is
++    considered. A value runs until the next line carrying ** or #, which lets
++    it wrap across lines. A bold line that is not a known label, such as a
++    document title above the fields, is skipped.
+     """
+     lines = (markdown_text or "").splitlines()
+     fields: Dict[str, list] = {}
+@@ -193,7 +205,7 @@
+         stripped = line.strip()
+         if not stripped:
+             continue
+-        if stripped.startswith("#") or BOLD_ONLY_LINE.match(stripped):
++        if stripped.startswith("#"):
+             cut = index
+             break
+         match = BOLD_FIELD_LINE.match(stripped)
+@@ -206,7 +218,8 @@
+             fields[current].append(stripped)
+ 
+     return ("\n".join(lines[cut:]),
+-            {key: "\n".join(value).strip() for key, value in fields.items()})
++            {key: unescape("\n".join(value).strip())
++             for key, value in fields.items()})
+ 
+ 
+ HEADING_LINE = re.compile(r"^(#{1,6})\s+(.*)$")
+@@ -238,6 +251,123 @@
+             "\n".join(sections).strip() + "\n")
+ 
+ 
++# ---- input authored without # headings ------------------------------------
++# "1. **PURPOSE:**", "**1. PURPOSE:**", "**Enclosure 1: References**  "
++BOLD_TITLE = re.compile(r"^(?P<num>\d+[.)]\s+)?\*\*\s*(?P<inner>\d+[.)]\s+)?"
++                        r"(?P<name>[^*]+?)\s*:?\s*\*\*\s*:?\s*$")
++ENCLOSURE_TITLE = re.compile(r"^ENCLOSURE\s*(\d+)?\s*[:.\-–—]\s*(.+)$", re.I)
++PART_TITLE = re.compile(r"^PART\s+(?:[IVXLC]+|\d+)\b", re.I)
++FENCE_LINE = re.compile(r"^ {0,3}(?:`{3,}|~{3,})")
++RULE_LINE = re.compile(r"^ {0,3}([-*_])(?:\s*\1){2,}\s*$")
++SIGNATURE_MARK = re.compile(r"SIGNATURE\s*BLOCK", re.I)
++# "a. text", "(1) text", "(a) text": list markers markdown does not know
++LETTER_MARKER = re.compile(r"^(\s*)(?:[A-Za-z][.)]|\((?:\d+|[A-Za-z])\))\s+(?=\S)")
++BACK_NAMES = {normalize(alias): name
++              for name, extra in cfg.BACK_MATTER.items()
++              for alias in (name,) + tuple(extra)}
++TOC_NAMES = {normalize(name) for name in cfg.TOC_TITLES}
++
++
++def promote_bold_titles(markdown_text: str):
++    """For input with no # headings: find the bold title lines and rewrite
++    them as # headings, split into (sections, enclosures, findings).
++
++    A title is a bold line at column 0 and nothing else. Before the first
++    enclosure it is a required section, list number optional and matched by
++    name; a numbered bold line matching nothing is still emitted so
++    split_sections reports it. An enclosure must read "Enclosure N: name",
++    since a bare bold line would match any bold word; the prefix is stripped.
++    APPENDICES, GLOSSARY with its PART lines, TABLES and FIGURES are back
++    matter and go with the enclosures for outline to peel off. Past the first
++    enclosure or back matter title a numbered bold line is body text, because
++    enclosure bodies use that shape for their own items.
++
++    Along the way: an authored TABLE OF CONTENTS block is dropped, --- lines
++    go, the indent under a numbered title is removed so its body is not read
++    as a code block, "a." and "(1)" markers become "1." so markdown nests the
++    lists and the cascade relabels them, and a fenced block naming the
++    signature block becomes a # SIGNATURE BLOCK section for take_section.
++
++    Returns None when the text already has a # heading, or no title at all"""
++    lines = [line.expandtabs(4) for line in (markdown_text or "").splitlines()]
++    if any(HEADING_LINE.match(line) for line in lines):
++        return None
++    sections, enclosures, findings = [], [], []
++    out, fence, indent, count, titles = sections, None, 0, 0, 0
++    dropping = in_glossary = False
++
++    for line in lines:
++        if fence is not None:
++            fence.append(line)
++            if FENCE_LINE.match(line):
++                body = [l.strip() for l in fence[1:-1] if l.strip()]
++                if body and SIGNATURE_MARK.search(body[0]):
++                    # always a section, wherever the author put the fence
++                    sections.extend(["", "# " + cfg.SIGNATURE_SECTION, ""]
++                                    + body[1:] + [""])
++                    findings.append("SIGNATURE BLOCK taken from the fenced "
++                                    "block (%d line(s))" % (len(body) - 1))
++                elif not dropping:
++                    out.extend(fence)
++                fence = None
++            continue
++        if FENCE_LINE.match(line):
++            fence = [line]
++            continue
++        if RULE_LINE.match(line):
++            continue
++
++        match = BOLD_TITLE.match(line)
++        if match:
++            name = match.group("name").strip()
++            key = normalize(name)
++            numbered = bool(match.group("num") or match.group("inner"))
++            enclosure = None if numbered else ENCLOSURE_TITLE.match(name)
++            back = not numbered and (key in BACK_NAMES or
++                                     (in_glossary and PART_TITLE.match(key)))
++            toc = not numbered and key in TOC_NAMES
++            if enclosure:
++                count += 1
++                written = int(enclosure.group(1) or count)
++                if written != count:
++                    findings.append("ENCLOSURE numbering: '%s' written as %d, "
++                                    "placed as %d" % (name, written, count))
++                name = enclosure.group(2).strip()
++            if enclosure or back or toc:
++                out = enclosures
++                # PART lines only mean something between GLOSSARY and the
++                # next enclosure or back matter title
++                in_glossary = BACK_NAMES.get(key) == "GLOSSARY" or (
++                    in_glossary and bool(PART_TITLE.match(key)))
++            if toc:
++                dropping = True
++                findings.append("TABLE OF CONTENTS block dropped; the table "
++                                "is generated")
++                continue
++            if enclosure or back or (out is sections and
++                                     (numbered or key in SECTION_ALIASES)):
++                out.extend(["", "# " + name, ""])
++                dropping, indent, titles = False, None, titles + 1
++                continue
++        if dropping:
++            continue
++        if not line.strip():
++            out.append(line)
++            continue
++        leading = len(line) - len(line.lstrip(" "))
++        indent = leading if indent is None else indent
++        line = LETTER_MARKER.sub(r"\g<1>1. ", line[min(indent, leading):])
++        out.append(line)
++
++    if fence is not None:            # never closed: keep it rather than lose it
++        out.extend(fence)
++    if not titles:
++        return None
++    findings.insert(0, "bold mode: no # headings, titles identified from "
++                       "bold lines")
++    return "\n".join(sections), "\n".join(enclosures), findings
++
++
+ def take_section(markdown_text: str, *names: str) -> Tuple[str, List[str]]:
+     """Lift one required section out as raw lines, before parsing.
+ 
+@@ -262,7 +392,8 @@
+                 continue
+         (taken if inside else kept).append(line)
+ 
+-    return "\n".join(kept), [line.strip() for line in taken if line.strip()]
++    return "\n".join(kept), [unescape(line.strip()) for line in taken
++                             if line.strip()]
+ 
+ 
+ def split_sections(markdown_text: str) -> Tuple[Dict[str, list], List[str]]:
+@@ -308,11 +439,19 @@
+     bookmark: str
+ 
+ 
++class BackMatter(NamedTuple):
++    """What the author supplied after the enclosures. Absent means not
++    written, apart from the glossary which falls back to config"""
++    pages: dict         # APPENDICES / TABLES / FIGURES -> [body nodes]
++    glossary: Optional[tuple]   # ([preamble nodes], [(part title, [nodes])])
++
++
+ class Outline(NamedTuple):
+     groups: list        # [(title node or None, [body nodes])] per enclosure
+     offset: int         # subtract from a heading level to normalise it
+     entries: list       # every TocEntry, in document order
+     titles: list        # enclosure titles, for the signature block
++    back: BackMatter
+ 
+ 
+ def outline(markdown_text: str) -> Outline:
+@@ -341,6 +480,24 @@
+     if title is not None or body:
+         groups.append((title, body))
+ 
++    # Back matter arrives as ordinary top-level groups (bold-mode input, or a
++    # # heading named APPENDICES). Peel those off so they are written after
++    # the enclosures in the fixed order rather than numbered among them
++    kept, pages, glossary, parts = [], {}, None, []
++    for title, body in groups:
++        key = normalize(heading_text(title)) if title is not None else ""
++        name = BACK_NAMES.get(key)
++        if name == "GLOSSARY":
++            glossary = body
++        elif name:
++            pages[name] = body
++        elif glossary is not None and PART_TITLE.match(key):
++            parts.append((heading_text(title), body))
++        else:
++            kept.append((title, body))
++    groups = kept
++    back = BackMatter(pages, (glossary, parts) if glossary is not None else None)
++
+     entries, titles = [], []
+ 
+     def add(level, text):
+@@ -356,14 +513,46 @@
+                 if level <= cfg.BACK["toc_depth"]:
+                     add(level, heading_text(node))
+ 
+-    # the back matter always exists, so its rows are fixed
+-    add(1, cfg.BACK["encl_last"])
+-    for part, _entries in cfg.BACK["glossary_parts"]:
+-        add(2, part)
+-    for name, _entries in cfg.BACK["trailing_lists"]:
+-        add(1, name)
+-
+-    return Outline(groups, offset, entries, titles)
++    # the same list write_back_matter walks, so the bookmark count agrees
++    for part in back_matter_plan(back):
++        add(part.level, part.title)
++
++    return Outline(groups, offset, entries, titles, back)
++
++
++class BackPart(NamedTuple):
++    key: str        # heading style: enclosure, appendices or glossary_part
++    level: int      # table of contents level
++    title: str
++    body: object    # config entries (tuple of str) or authored [nodes]
++    authored: bool
++
++
++def back_matter_plan(back: BackMatter) -> List[BackPart]:
++    """Everything after the enclosures, in the order it is written.
++
++    One list feeds both outline (ToC rows, bookmark names) and
++    write_back_matter, so they can never disagree on how many pages there
++    are. Only pages the author supplied are written, apart from the glossary,
++    which falls back to config.BACK["glossary_parts"]"""
++    conf = cfg.BACK
++    parts: List[BackPart] = []
++    if "APPENDICES" in back.pages:
++        parts.append(BackPart("appendices", 1, conf["appendices_title"],
++                              back.pages["APPENDICES"], True))
++    if back.glossary is not None:
++        preamble, authored = back.glossary
++        parts.append(BackPart("enclosure", 1, conf["encl_last"], preamble, True))
++        parts += [BackPart("glossary_part", 2, title, body, True)
++                  for title, body in authored]
++    else:
++        parts.append(BackPart("enclosure", 1, conf["encl_last"], (), False))
++        parts += [BackPart("glossary_part", 2, title, entries, False)
++                  for title, entries in conf["glossary_parts"]]
++    for name in ("TABLES", "FIGURES"):
++        if name in back.pages:
++            parts.append(BackPart("enclosure", 1, name, back.pages[name], True))
++    return parts
+ 
+ 
+ # =========================================================================== #
+@@ -426,8 +615,11 @@
+         return paragraph
+ 
+     def write_paragraph(self, node, position):
+-        text = logic.spans_text(
+-            logic.inline_spans(logic.find_inline_child(node))).strip()
++        # a hard line break separates words; without this "Overview:" and
++        # the text on the next line run together
++        spans = logic.inline_spans(logic.find_inline_child(node))
++        text = " ".join("".join(" " if span.is_line_break else span.text
++                                for span in spans).split())
+         if not text:
+             return None
+         if position.list_depth < 0:
+@@ -573,22 +765,25 @@
+                       placeholder=cfg.BACK["toc_placeholder"])
+ 
+ 
+-def write_back_matter(document, bookmarks: List[str]):
+-    """Glossary with its parts, then the tables and figures lists"""
+-    back = cfg.BACK
+-    paragraph = write(document, "enclosure", back["encl_last"])
+-    helpers.add_bookmark(paragraph, bookmarks.pop(0))
+-    for part, entries in back["glossary_parts"]:
+-        paragraph = write(document, "glossary_part", part)
+-        helpers.add_bookmark(paragraph, bookmarks.pop(0))
+-        for entry in entries:
+-            lead_in, rest = split_lead_in(entry)
+-            write(document, "definition", rest, lead_in=lead_in)
+-    for name, entries in back["trailing_lists"]:
+-        paragraph = write(document, "enclosure", name)
++def write_back_matter(document, bookmarks: List[str], back: BackMatter,
++                      opts, numbering):
++    """Appendices, the glossary with its parts, then tables and figures.
++
++    Which pages exist comes from back_matter_plan. Config entries are written
++    as "Term: definition" lines; authored content goes through DlaiWriter
++    flush left and unnumbered, with lead-in titles underlined"""
++    for part in back_matter_plan(back):
++        paragraph = write(document, part.key, part.title)
+         helpers.add_bookmark(paragraph, bookmarks.pop(0))
+-        for entry in entries:
+-            write(document, "prose", entry)
++        if not part.authored:
++            for entry in part.body:
++                lead_in, rest = split_lead_in(entry)
++                write(document, "definition", rest, lead_in=lead_in)
++        elif part.body:
++            DlaiWriter(document, opts, numbering, new_cascade_list(numbering),
++                       base_level=-1, min_level=0, blocks=("subsection",),
++                       body_key="flat", lead_key="definition"
++                       ).write_blocks(part.body, logic.Position())
+ 
+ 
+ def main(argv=None) -> int:
+--- a/dlai_to_docx.py
++++ b/dlai_to_docx.py
+@@ -24,6 +24,15 @@
+     Returns (bytes, findings). Nothing touches the filesystem, so this is what
+     a route hands straight back to the caller.
+     """
++    # No # headings anywhere: the titles are bold lines. promote_bold_titles
++    # rewrites them as # headings and does the section/enclosure split, so
++    # from here down nothing knows which way the document was authored
++    findings: List[str] = []
++    promoted = dlai.promote_bold_titles("\n".join(
++        part for part in (sections_input, markdown_input) if part))
++    if promoted:
++        sections_input, markdown_input, findings = promoted
++
+     # strip the "**OPR:** value" block off the top of either input
+     sections_input, cover = dlai.split_cover(sections_input)
+     markdown_input, more = dlai.split_cover(markdown_input)
+@@ -44,8 +53,9 @@
+     dlai.write_cover(document, numbering, doc_title, cover)
+ 
+     # 3. the required sections, matched out of sections_input
+-    findings, signature = write_required_sections(
++    more, signature = write_required_sections(
+         document, opts, numbering, sections_input)
++    findings += more
+ 
+     # 4. signature block and table of contents, both built from the plan
+     dlai.write_signature_block(document, plan.titles, signature)
+@@ -53,7 +63,7 @@
+ 
+     # 5. the enclosures themselves, then the fixed back matter
+     write_enclosures(document, opts, numbering, plan, bookmarks)
+-    dlai.write_back_matter(document, bookmarks)
++    dlai.write_back_matter(document, bookmarks, plan.back, opts, numbering)
+ 
+     # 6. tell Word to refresh page numbers on open, then serialise to bytes
+     helpers.update_fields_on_open(document)
+@@ -83,11 +93,13 @@
+             dlai.write(document, "prose", cfg.MISSING_PLACEHOLDER,
+                        level=1, num_id=num_id)
+             continue
+-        # DEFINITIONS is the one section that sits flush left and unnumbered
+-        key = "definition" if name in cfg.FLAT_SECTIONS else None
++        # DEFINITIONS is the one section that sits flush left and unnumbered:
++        # "Term: definition" lines underlined, anything else plain
++        flat = name in cfg.FLAT_SECTIONS
+         dlai.DlaiWriter(document, opts, numbering, num_id, base_level=0,
+                         min_level=1, blocks=("subsection",),
+-                        body_key=key or "prose", lead_key=key or "subsection"
++                        body_key="flat" if flat else "prose",
++                        lead_key="definition" if flat else "subsection"
+                         ).write_blocks(nodes, logic.Position())
+     return findings, signature
+ 
