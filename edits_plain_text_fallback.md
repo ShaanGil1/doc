@@ -3,7 +3,7 @@
 The core code of the session as complete replacement blocks, in apply order: one new module and two modified
 files. Tests, fixtures and docs are in the repository commits, not here. `md_to_docx/` and
 `models/boundary_map.py` are untouched. Fences use four backticks because the prompt text contains ``` fences.
-After applying, `python run_all.py --no-live` must end ALL GOOD (46 converter checks, 71 agent checks).
+After applying, `python run_all.py --no-live` must end ALL GOOD (46 converter checks, 70 agent checks).
 
 ## 1. `md_section_agent/fallback_agent.py` (add file)
 
@@ -20,7 +20,7 @@ import agent as base  # attribute access at call time only: agent imports this m
 import config as cfg  # md_to_docx/config.py
 from models.boundary_map import SECTION_FIELDS, BoundaryMap, Where
 from models.prompts import FALLBACK, PLAIN_EXAMPLE_ANSWER, PLAIN_EXAMPLE_DOC
-from rules import COVER_FIELDS, FENCE_LINE, SECTION_ALIASES, SIGNATURE_LINE, Start, normalize
+from rules import COVER_FIELDS, ENCLOSURE_TITLE, FENCE_LINE, SECTION_ALIASES, SIGNATURE_LINE, Start, normalize
 
 HELD = ("section", "enclosure", "appendices", "glossary", "glossary_part", "tables", "figures")  # keep every line
 SHORT = ("cover", "signature", "toc")  # trusted up to FALLBACK_SHORT_BODY lines: past that they hold what nobody placed
@@ -112,12 +112,18 @@ def plain_instruction(hint_text: str) -> str:
     }
 
 
+def title_key(title: str) -> str:
+    """An enclosure title as the duplicate check compares it: an 'Enclosure N:' prefix dropped the way to_starts
+    drops it, then normalised"""
+    return normalize(ENCLOSURE_TITLE.sub(r"\2", title.strip()))
+
+
 def one_of_each(result, findings) -> None:
     """An enclosure title reported twice is the written ToC entry and the real title: the later line, the one with
     the content beneath it, is kept."""
     kept: Dict[str, object] = {}
     for entry in result.enclosures:
-        key = base.enclosure_key(entry.title)
+        key = title_key(entry.title)
         if key in kept:
             findings.append(
                 "LLM fallback: enclosure %r reported twice (lines %d and %d); the later line kept"
@@ -220,8 +226,8 @@ def report(before, before_enclosures, before_titles, after, after_enclosures, af
             out.append("LLM fallback: %s (line %d on the first pass) not placed by the fallback" % (name, was + 1))
         elif now != was:
             out.append("LLM fallback: %s moved from line %d to line %d" % (name, was + 1, now + 1))
-    was_lines = {base.enclosure_key(before_titles.get(i, "")): i for i in before_enclosures}
-    now_lines = {base.enclosure_key(after_titles.get(i, "")): i for i in after_enclosures}
+    was_lines = {title_key(before_titles.get(i, "")): i for i in before_enclosures}
+    now_lines = {title_key(after_titles.get(i, "")): i for i in after_enclosures}
     for key, was in sorted(was_lines.items(), key=lambda item: item[1]):
         now = now_lines.get(key)
         if now is None:
@@ -447,79 +453,6 @@ FALLBACK_SHORT_BODY = 15  # cover, signature and ToC bodies are trusted up to th
         return starts, mode, findings
 ````
 
-### In class `SectionAgent`, replace method `reconcile` with
-
-````python
-    def reconcile(self, placed, enclosure_lines, titles, lines, findings):
-        """Where the model and the rules placed a block on different lines, one call shows both and the model picks."""
-        rule_fields, rule_enclosures = rule_placements(lines)
-        conflicts = []  # (label, field_or_title, model_line, rules_line)
-        for name, line in placed.items():
-            other = rule_fields.get(name)
-            if other is not None and other != line:
-                conflicts.append((name, name, line, other))
-        for line in enclosure_lines:
-            title = titles.get(line, "")
-            other = rule_enclosures.get(enclosure_key(title))
-            if other is not None and other != line:
-                conflicts.append(("enclosure:%s" % title, title, line, other))
-        if not conflicts:
-            return placed, enclosure_lines, titles
-
-        text = []
-        for label, _, mine, theirs in conflicts:
-            text.append(
-                "BLOCK %s\n  candidate A (your answer), around line %d:\n%s\n  candidate B (the rules), around line %d:\n%s"
-                % (label, mine + 1, excerpt(lines, mine), theirs + 1, excerpt(lines, theirs))
-            )
-        try:
-            answer = self.structured(
-                instruction() + "\n\n" + RECONCILE % {"conflicts": "\n\n".join(text)},
-                "Pick the title line for each block listed in the instructions.",
-                Reconciliation,
-            )
-        except LlmUnavailable as error:
-            findings.append("LLM: reconciliation unavailable (%s); model placements kept" % error)
-            return placed, enclosure_lines, titles
-
-        picks = {pick.field: pick for pick in answer.picks}
-        for label, key, mine, theirs in conflicts:
-            pick = picks.get(label)
-            chosen = None
-            if pick is not None and pick.line > 0:
-                index = verify(
-                    Where(line=pick.line, starts_with=pick.starts_with),
-                    lines,
-                    [],
-                    label,
-                    "enclosure" if label.startswith("enclosure:") else kind_of(key),
-                )
-                if index in (mine, theirs):
-                    chosen = index
-            if chosen is None:
-                findings.append(
-                    "LLM reconciliation for %s: no valid pick; model line %d kept over rules line %d"
-                    % (label, mine + 1, theirs + 1)
-                )
-                continue
-            if chosen == mine:
-                findings.append(
-                    "LLM reconciliation for %s: model line %d confirmed over rules line %d"
-                    % (label, mine + 1, theirs + 1)
-                )
-                continue
-            findings.append(
-                "LLM reconciliation for %s: rules line %d chosen over model line %d" % (label, theirs + 1, mine + 1)
-            )
-            if label.startswith("enclosure:"):
-                enclosure_lines[enclosure_lines.index(mine)] = theirs
-                titles[theirs] = titles.pop(mine)
-            else:
-                placed[key] = theirs
-        enclosure_lines.sort()
-        return placed, enclosure_lines, titles
-````
-
 ### Replace function `verify` with
 
 ````python
@@ -599,7 +532,7 @@ def check_map(
         if index is None:
             failed.append(label)
             continue
-        key = enclosure_key(entry.title)
+        key = normalize(entry.title)
         if key in titles_seen:
             findings.append(
                 "LLM: enclosure %r reported twice (lines %d and %d); the "
@@ -692,82 +625,6 @@ def check_map(
     return placed, enclosures, failed, reasons
 ````
 
-### Replace function `backfill` with
-
-````python
-def backfill(placed, enclosure_lines, titles, failed, lines, findings, filled=None):
-    """Blanks and stubborn failures are taken from the rules when they find a title line; never overrides a placed
-    block."""
-    starts, _ = boundaries.regex_boundaries(lines)
-    taken = set(placed.values()) | set(enclosure_lines)
-    for start in starts:
-        if start.line in taken:
-            continue
-        if start.kind == "enclosure":
-            if enclosure_key(start.name) in {enclosure_key(t) for t in titles.values()}:
-                continue
-            enclosure_lines.append(start.line)
-            titles[start.line] = start.name
-            if filled is not None:
-                filled.append("enclosure:%s" % start.name)
-            findings.append("LLM missed enclosure %r; found by the rules at line %d" % (start.name, start.line + 1))
-            failed = [f for f in failed if f != "enclosure:%s" % start.name]
-            taken.add(start.line)
-            continue
-        field = rule_field(start)
-        if field is None or field in placed:
-            continue
-        placed[field] = start.line
-        taken.add(start.line)
-        if filled is not None:
-            filled.append(field)
-        findings.append(
-            "LLM %s %s; found by the rules at line %d"
-            % ("could not place" if field in failed else "omitted", field, start.line + 1)
-        )
-        failed = [f for f in failed if f != field]
-    enclosure_lines.sort()
-    return placed, enclosure_lines, titles, failed
-````
-
-### Replace function `provenance` with
-
-````python
-def provenance(placed, enclosure_lines, titles, filled, lines) -> List[str]:
-    """ "N blocks from the model, M from the rules", then every remaining disagreement with the rules (model kept)."""
-    total = len(placed) + len(enclosure_lines)
-    out = [
-        "LLM: %d block(s) from the model, %d from the rules%s"
-        % (total - len(filled), len(filled), (" (%s)" % ", ".join(filled)) if filled else "")
-    ]
-    rule_lines, rule_enclosures = rule_placements(lines)
-    for name, line in sorted(placed.items(), key=lambda item: item[1]):
-        if name in filled:
-            continue
-        other = rule_lines.get(name)
-        if other is None:
-            out.append("LLM: %s at line %d; the rules see no title there (model kept)" % (name, line + 1))
-        elif other != line:
-            out.append(
-                "LLM and rules disagree on %s: model line %d, rules line %d (model kept)" % (name, line + 1, other + 1)
-            )
-    for line in enclosure_lines:
-        title = titles.get(line, "")
-        if "enclosure:%s" % title in filled:
-            continue
-        other = rule_enclosures.get(enclosure_key(title))
-        if other is None:
-            out.append(
-                "LLM: enclosure %r at line %d; the rules see no enclosure there (model kept)" % (title, line + 1)
-            )
-        elif other != line:
-            out.append(
-                "LLM and rules disagree on enclosure %r: model line %d, rules line %d (model kept)"
-                % (title, line + 1, other + 1)
-            )
-    return out
-````
-
 ### Replace function `enclosure_titles` with
 
 ````python
@@ -779,27 +636,6 @@ def enclosure_titles(result, enclosure_lines, lines, shaped: bool = True) -> Dic
         if index is not None and index in enclosure_lines and index not in titles:
             titles[index] = entry.title
     return titles
-````
-
-### Add before function `plain_title`
-
-````python
-def enclosure_name(raw: str) -> Tuple[Optional[int], str]:
-    """(number, title) from an enclosure title as written or as the model gave it, every 'Enclosure N:' prefix
-    stripped, so a prefix the model added (even twice) is never printed in front of the generated one"""
-    number, title = None, raw.strip()
-    while True:
-        match = ENCLOSURE_TITLE.match(title)
-        if not match:
-            return number, title
-        if number is None and match.group(1):
-            number = int(match.group(1))
-        title = match.group(2).strip()
-
-
-def enclosure_key(title: str) -> str:
-    """The comparison key for an enclosure title: prefix stripped, then normalised"""
-    return normalize(enclosure_name(title)[1])
 ````
 
 ### Replace function `to_starts` with
@@ -838,18 +674,17 @@ def to_starts(
         else:  # appendices, glossary, tables, figures
             starts.append(Start(name, plain_title(line), index))
     for index in enclosure_lines:
-        raw = titles.get(index) or plain_title(lines[index])  # the model's title, else the line
-        line_title = plain_title(lines[index])
-        number, title = enclosure_name(raw if ENCLOSURE_TITLE.match(raw) else line_title)
-        if number is None and not ENCLOSURE_TITLE.match(line_title):
-            title = raw.strip()  # neither carries a prefix (a "## References" heading): the model's title as given
+        raw = titles.get(index) or plain_title(lines[index])
+        match = ENCLOSURE_TITLE.match(raw) or ENCLOSURE_TITLE.match(plain_title(lines[index]))
+        number = int(match.group(1)) if match and match.group(1) else None
+        title = match.group(2).strip() if match else raw.strip()
         starts.append(Start("enclosure", title, index, number=number))
     return sorted(starts, key=lambda s: s.line)
 ````
 
 ## Verify
 
-    python run_all.py --no-live                       # ALL GOOD: 46 + 71, every formatted input byte-identical
+    python run_all.py --no-live                       # ALL GOOD: 46 + 70, every formatted input byte-identical
     python main.py md_section_agent/tests/plain_text.md out.docx --title "SOP 9999.92" --template SOP
     python md_section_agent/tests/live_llm.py md_section_agent/tests/plain_text.md   # with a key: the fallback live
 
